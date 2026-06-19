@@ -111,17 +111,14 @@ fi
 
 echo -e "\n${YELLOW}🌐 [4/7] 延迟 & TikTok解锁...${NC}"
 
-# --- 多节点延迟测试 ---
 echo -e "   ${YELLOW}正在测试到各地域的延迟...${NC}"
-
-# 定义测试节点
 declare -A delay_nodes=(
+    ["114DNS(全国)"]="114.114.114.114"
     ["中科院(北京)"]="159.226.8.6"
-    ["北京联通(北京)"]="123.123.123.123"
     ["百度(全国CDN)"]="www.baidu.com"
+    ["北京联通(北京)"]="123.123.123.123"
     ["腾讯云(全国Anycast)"]="119.29.29.29"
     ["阿里云(全国Anycast)"]="223.5.5.5"
-    ["114DNS(全国)"]="114.114.114.114"
 )
 
 all_latencies=()
@@ -130,7 +127,6 @@ delay_details=()
 for name in "${!delay_nodes[@]}"; do
     ip="${delay_nodes[$name]}"
     ping_result=$(ping -c 1 -W 2 "$ip" 2>/dev/null | grep 'time=' | awk -F 'time=' '{print $2}' | cut -d ' ' -f1)
-    
     if [[ -n "$ping_result" ]]; then
         lat=$(printf "%.1f" "$ping_result")
         all_latencies+=("$lat")
@@ -145,7 +141,6 @@ for detail in "${delay_details[@]}"; do
     echo -e "   $detail"
 done
 
-# --- 计算综合延迟评分 ---
 if [[ ${#all_latencies[@]} -gt 0 ]]; then
     sum=0
     for lat in "${all_latencies[@]}"; do
@@ -184,34 +179,24 @@ esac
 
 echo -e "   ${GREEN}综合平均延迟: ${lat_int}ms (区域:$region) -> 得分: ${lat_score}/10${NC}"
 
-# --- TikTok解锁检测（增强版，带超时保护） ---
 echo -e "   ${YELLOW}TikTok检测中...${NC}"
-
-# 使用 timeout 强制限制执行时间，避免卡死
 tiktok_response=$(timeout 6 curl -sL --max-time 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://www.tiktok.com/" 2>/dev/null)
-
-# 检查 curl 是否超时或失败
 if [[ -z "$tiktok_response" ]] || [[ "$tiktok_response" == *"timed out"* ]] || [[ "$tiktok_response" == *"curl: ("* ]]; then
     tiktok_score=2
     tiktok_region="无"
     echo -e "   ${YELLOW}⚠️ TikTok 请求超时或无法访问 (给基础分)${NC}"
 else
-    # 提取 HTTP 状态码
     tiktok_code=$(echo "$tiktok_response" | head -1 | grep -o "HTTP/.*" | tail -1 | awk '{print $2}' || echo "000")
     if [[ -z "$tiktok_code" || "$tiktok_code" == "000" ]]; then
         tiktok_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://www.tiktok.com/" 2>/dev/null)
     fi
-
     tiktok_score=0
     tiktok_region="无"
-
     if [[ "$tiktok_code" == "200" ]]; then
-        # 尝试提取 region
         tiktok_region=$(echo "$tiktok_response" | grep -oE '"region":"[^"]*"' | head -1 | cut -d'"' -f4)
         if [[ -z "$tiktok_region" || "$tiktok_region" == "null" ]]; then
             tiktok_region=$(echo "$tiktok_response" | grep -oP '(?<=region":")[^"]+' | head -1)
         fi
-
         if [[ -n "$tiktok_region" && "$tiktok_region" != "null" && "$tiktok_region" != "undefined" ]]; then
             if [[ "$tiktok_region" == "US" || "$tiktok_region" == "JP" || "$tiktok_region" == "HK" || "$tiktok_region" == "KR" ]]; then
                 tiktok_score=3
@@ -229,21 +214,15 @@ else
         echo -e "   ${RED}❌ TikTok: 无法访问 (HTTP $tiktok_code)${NC}"
     fi
 fi
-
-# 确保变量始终有值，防止后续计算报错
 [[ -z "$tiktok_score" ]] && tiktok_score=0
 [[ -z "$tiktok_region" ]] && tiktok_region="无"
 
-
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由（多节点检测）...${NC}"
-
-# 安装 traceroute（如果未安装）
 if ! command -v traceroute &> /dev/null; then
     echo -e "   ${YELLOW}正在安装 traceroute...${NC}"
     apt install traceroute -y >/dev/null 2>&1 || yum install traceroute -y >/dev/null 2>&1
 fi
 
-# 检测节点列表（国内三网代表性城市）
 declare -A nodes=(
     ["北京电信"]="219.141.140.10"
     ["上海电信"]="202.96.209.133"
@@ -255,55 +234,31 @@ declare -A nodes=(
     ["成都移动"]="211.137.96.205"
 )
 
-# 评分变量
-cn2_count=0
-cn2gt_count=0
-cn2gia_count=0
-telecom_163=0
-unicom_4837=0
-mobile_cmi=0
-detect_total=0
-detect_success=0
-route_summary=()
-
+cn2gia_count=0; cn2gt_count=0; telecom_163=0; unicom_4837=0; mobile_cmi=0; detect_success=0; route_summary=()
 echo -e "   ${YELLOW}正在检测多节点回程路由...${NC}"
-
 for node_name in "${!nodes[@]}"; do
     target_ip="${nodes[$node_name]}"
-    # 超时6秒，追踪15跳
     route_output=$(timeout 6 traceroute -T -p 80 -m 15 "$target_ip" 2>/dev/null)
     if [[ -n "$route_output" ]]; then
         detect_success=$((detect_success + 1))
-        # 检测线路特征（按优先级从高到低）
-        # 1. 检测 CN2 精品线路（最高优先级）
         if echo "$route_output" | grep -qiE "59\.43|CTGNET|CN2"; then
             if echo "$route_output" | grep -qiE "GIA"; then
-                cn2gia_count=$((cn2gia_count + 1))
-                route_summary+=("${node_name}: CN2 GIA ✅")
+                cn2gia_count=$((cn2gia_count + 1)); route_summary+=("${node_name}: CN2 GIA ✅")
             else
-                cn2gt_count=$((cn2gt_count + 1))
-                route_summary+=("${node_name}: CN2 GT ✅")
+                cn2gt_count=$((cn2gt_count + 1)); route_summary+=("${node_name}: CN2 GT ✅")
             fi
-        # 2. 检测联通线路（第二优先级，避免被电信关键词误判）
         elif echo "$route_output" | grep -qiE "AS4837|4837|chinaunicom|CNC"; then
-            unicom_4837=$((unicom_4837 + 1))
-            route_summary+=("${node_name}: 联通4837")
-        # 3. 检测移动线路（第三优先级）
+            unicom_4837=$((unicom_4837 + 1)); route_summary+=("${node_name}: 联通4837")
         elif echo "$route_output" | grep -qiE "AS9808|9808|CMI|AS58453|chinamobile|CMCC"; then
-            mobile_cmi=$((mobile_cmi + 1))
-            route_summary+=("${node_name}: 移动CMI")
-        # 4. 检测电信163普通线路（最后匹配）
+            mobile_cmi=$((mobile_cmi + 1)); route_summary+=("${node_name}: 移动CMI")
         elif echo "$route_output" | grep -qiE "202\.97|163"; then
-            telecom_163=$((telecom_163 + 1))
-            route_summary+=("${node_name}: 电信163")
+            telecom_163=$((telecom_163 + 1)); route_summary+=("${node_name}: 电信163")
         else
             route_summary+=("${node_name}: 未知线路")
         fi
-        detect_total=$((detect_total + 1))
     fi
 done
 
-# 显示检测结果摘要（只显示前5个，避免刷屏）
 echo -e "   ${GREEN}检测结果摘要:${NC}"
 for ((i=0; i<${#route_summary[@]} && i<6; i++)); do
     echo -e "     ${route_summary[$i]}"
@@ -312,39 +267,27 @@ if [[ ${#route_summary[@]} -gt 6 ]]; then
     echo -e "     ... 共 ${#route_summary[@]} 个节点"
 fi
 
-# 综合评分（满分10分）
 if [[ $detect_success -eq 0 ]]; then
-    route_score=5
-    route_desc="所有节点检测失败"
+    route_score=5; route_desc="所有节点检测失败"
 elif [[ $cn2gia_count -gt 0 ]]; then
-    route_score=10
-    route_desc="CN2 GIA直连（${cn2gia_count}个节点）"
+    route_score=10; route_desc="CN2 GIA直连（${cn2gia_count}个节点）"
 elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $unicom_4837 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
-    route_score=9
-    route_desc="纯CN2 GT直连（${cn2gt_count}个节点）"
+    route_score=9; route_desc="纯CN2 GT直连（${cn2gt_count}个节点）"
 elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -gt 0 ]]; then
-    route_score=7
-    route_desc="混合线路（CN2 GT + 电信163）"
+    route_score=7; route_desc="混合线路（CN2 GT + 电信163）"
 elif [[ $cn2gt_count -gt 0 ]] && [[ $unicom_4837 -gt 0 ]]; then
-    route_score=7
-    route_desc="混合线路（CN2 GT + 联通4837）"
+    route_score=7; route_desc="混合线路（CN2 GT + 联通4837）"
 elif [[ $cn2gt_count -gt 0 ]] && [[ $mobile_cmi -gt 0 ]]; then
-    route_score=7
-    route_desc="混合线路（CN2 GT + 移动CMI）"
+    route_score=7; route_desc="混合线路（CN2 GT + 移动CMI）"
 elif [[ $telecom_163 -gt 0 ]] && [[ $unicom_4837 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
-    route_score=6
-    route_desc="电信163普通线路"
+    route_score=6; route_desc="电信163普通线路"
 elif [[ $unicom_4837 -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
-    route_score=6
-    route_desc="联通4837普通线路"
+    route_score=6; route_desc="联通4837普通线路"
 elif [[ $mobile_cmi -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $unicom_4837 -eq 0 ]]; then
-    route_score=6
-    route_desc="移动CMI普通线路"
+    route_score=6; route_desc="移动CMI普通线路"
 else
-    route_score=5
-    route_desc="多运营商混合线路"
+    route_score=5; route_desc="多运营商混合线路"
 fi
-
 echo -e "   回程综合评分: ${route_score}/10 (${route_desc})"
 
 echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
@@ -352,10 +295,7 @@ baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.bai
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
 
-speed_score=3
-speed_desc="测速失败"
-upload_mbps=0
-
+speed_score=3; speed_desc="测速失败"; upload_mbps=0
 if ! command -v speedtest-cli &> /dev/null; then
     echo -e "   ${YELLOW}正在安装 speedtest-cli（约10秒）...${NC}"
     apt install speedtest-cli -y >/dev/null 2>&1 || yum install speedtest-cli -y >/dev/null 2>&1
@@ -364,7 +304,6 @@ if ! command -v speedtest-cli &> /dev/null; then
         pip3 install speedtest-cli -q >/dev/null 2>&1
     fi
 fi
-
 if command -v speedtest-cli &> /dev/null; then
     echo -e "   ${YELLOW}正在测速（约30秒，测出站带宽）...${NC}"
     st_result=$(timeout 35 speedtest-cli --simple 2>/dev/null)
@@ -378,7 +317,6 @@ if command -v speedtest-cli &> /dev/null; then
         fi
     fi
 fi
-
 if [[ -z "$upload_mbps" || "$upload_mbps" == "0" || "$upload_mbps" == "0.0" ]]; then
     echo -e "   ${YELLOW}speedtest 不可用，改用多源下载测速...${NC}"
     max_speed=0
@@ -400,13 +338,11 @@ if [[ -z "$upload_mbps" || "$upload_mbps" == "0" || "$upload_mbps" == "0.0" ]]; 
         upload_mbps=$max_speed
         speed_desc="入站参考(${upload_mbps}Mbps)"
     else
-        upload_mbps=0
-        speed_desc="测速失败"
+        upload_mbps=0; speed_desc="测速失败"
     fi
 else
     speed_desc="出站(${upload_mbps}Mbps)"
 fi
-
 if [[ -n "$upload_mbps" && "$upload_mbps" != "0" && "$upload_mbps" != "0.0" ]]; then
     if (( $(echo "$upload_mbps >= 80" | bc -l) )); then speed_score=10
     elif (( $(echo "$upload_mbps >= 50" | bc -l) )); then speed_score=9
@@ -419,37 +355,28 @@ if [[ -n "$upload_mbps" && "$upload_mbps" != "0" && "$upload_mbps" != "0.0" ]]; 
 else
     speed_score=3
 fi
-
 echo -e "   带宽: $speed_desc -> ${speed_score}/10"
 score_net=$(echo "scale=1; $tcp_score * 0.3 + $lat_score * 0.4 + $speed_score * 0.3" | bc)
 
 echo -e "\n${YELLOW}📺 [7/7] 流媒体解锁...${NC}"
-
-# 定义 User-Agent
 BrowserUA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-# 初始化总分
 stream_score=0
 declare -a stream_results
 
-# ----- Netflix 检测 -----
 echo -e "   ${YELLOW}检测 Netflix...${NC}"
 result1=$(curl --user-agent "${BrowserUA}" -fsL --write-out %{http_code} --output /dev/null --max-time 10 "https://www.netflix.com/title/81280792" 2>&1)
 if [[ "$result1" == "404" ]]; then
-    stream_results+=("Netflix: Originals Only")
-    stream_score=$((stream_score + 2))
+    stream_results+=("Netflix: Originals Only"); stream_score=$((stream_score + 2))
 elif [[ "$result1" == "403" ]]; then
     stream_results+=("Netflix: ❌ 不可用")
 elif [[ "$result1" == "200" ]]; then
     region=$(curl --user-agent "${BrowserUA}" -fsL --max-time 10 --write-out %{redirect_url} --output /dev/null "https://www.netflix.com/title/80018499" | cut -d '/' -f4 | cut -d '-' -f1)
     [[ -z "$region" ]] && region="US"
-    stream_results+=("Netflix: ✅ 解锁 (区域: ${region})")
-    stream_score=$((stream_score + 4))
+    stream_results+=("Netflix: ✅ 解锁 (区域: ${region})"); stream_score=$((stream_score + 4))
 else
     stream_results+=("Netflix: ⚠️ 连接失败")
 fi
 
-# ----- YouTube Premium 检测 -----
 echo -e "   ${YELLOW}检测 YouTube Premium...${NC}"
 tmpresult=$(curl --max-time 10 -sS -H "Accept-Language: en" "https://www.youtube.com/premium" 2>&1)
 region=$(curl --user-agent "${BrowserUA}" -sL --max-time 10 "https://www.youtube.com/premium" | grep "countryCode" | sed 's/.*"countryCode"//' | cut -f2 -d'"')
@@ -460,67 +387,49 @@ fi
 if echo "$tmpresult" | grep -q "Premium is not available in your country"; then
     stream_results+=("YouTube Premium: ❌ 不可用 (区域: ${region})")
 elif echo "$tmpresult" | grep -q "YouTube and YouTube Music ad-free"; then
-    stream_results+=("YouTube Premium: ✅ 可用 (区域: ${region})")
-    stream_score=$((stream_score + 3))
+    stream_results+=("YouTube Premium: ✅ 可用 (区域: ${region})"); stream_score=$((stream_score + 3))
 else
     stream_results+=("YouTube Premium: ⚠️ 检测失败")
 fi
 
-# ----- Bilibili 检测 -----
 echo -e "   ${YELLOW}检测 Bilibili...${NC}"
 bilibili_status=""
-# 检测大陆限定
 randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
 result=$(curl --user-agent "${BrowserUA}" -fsSL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=82846771&qn=0&type=&otype=json&ep_id=307247&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
 if [[ "$result" != "curl"* ]]; then
     code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
-    if [ "$code" = "0" ]; then
-        bilibili_status="大陆限定"
-    fi
+    if [ "$code" = "0" ]; then bilibili_status="大陆限定"; fi
 fi
-# 检测港澳台限定
 if [ -z "$bilibili_status" ]; then
     randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
     result=$(curl --user-agent "${BrowserUA}" -fsSL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
     if [[ "$result" != "curl"* ]]; then
         code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
-        if [ "$code" = "0" ]; then
-            bilibili_status="港澳台限定"
-        fi
+        if [ "$code" = "0" ]; then bilibili_status="港澳台限定"; fi
     fi
 fi
-# 检测台湾限定
 if [ -z "$bilibili_status" ]; then
     randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
     result=$(curl --user-agent "${BrowserUA}" -fsSL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=50762638&cid=100279344&qn=0&type=&otype=json&ep_id=268176&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
     if [[ "$result" != "curl"* ]]; then
         code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
-        if [ "$code" = "0" ]; then
-            bilibili_status="台湾限定"
-        fi
+        if [ "$code" = "0" ]; then bilibili_status="台湾限定"; fi
     fi
 fi
 if [ -n "$bilibili_status" ]; then
-    stream_results+=("Bilibili: ✅ 解锁 (${bilibili_status})")
-    stream_score=$((stream_score + 2))
+    stream_results+=("Bilibili: ✅ 解锁 (${bilibili_status})"); stream_score=$((stream_score + 2))
 else
     stream_results+=("Bilibili: ❌ 不可用")
 fi
 
-# ----- iQIYI 检测 -----
 echo -e "   ${YELLOW}检测 iQIYI...${NC}"
 curl --user-agent "${BrowserUA}" -s -I --max-time 10 "https://www.iq.com/" > /tmp/iqiyi 2>/dev/null
 if [ $? -eq 0 ]; then
     iqiyi_region=$(cat /tmp/iqiyi | grep 'mod=' | awk '{print $2}' | cut -f2 -d'=' | cut -f1 -d';')
     rm -f /tmp/iqiyi
     if [ -n "$iqiyi_region" ]; then
-        if [[ "$iqiyi_region" == "ntw" ]]; then
-            iqiyi_region="TW"
-        else
-            iqiyi_region=$(echo "$iqiyi_region" | tr '[:lower:]' '[:upper:]')
-        fi
-        stream_results+=("iQIYI: ✅ 解锁 (区域: ${iqiyi_region})")
-        stream_score=$((stream_score + 1))
+        if [[ "$iqiyi_region" == "ntw" ]]; then iqiyi_region="TW"; else iqiyi_region=$(echo "$iqiyi_region" | tr '[:lower:]' '[:upper:]'); fi
+        stream_results+=("iQIYI: ✅ 解锁 (区域: ${iqiyi_region})"); stream_score=$((stream_score + 1))
     else
         stream_results+=("iQIYI: ⚠️ 检测失败")
     fi
@@ -528,46 +437,32 @@ else
     stream_results+=("iQIYI: ⚠️ 连接失败")
 fi
 
-# ----- TikTok 检测（已有，保留但整合输出格式） -----
-# 注意：这部分在你的脚本里已经有了，如果保留则注释掉下面的重复检测
-# 如果上面的 TikTok 检测已经存在，可以跳过这里，或者统一用这里的逻辑替换
-# 这里为了完整性保留，但实际使用时请根据你的脚本结构调整
-
-# ----- ChatGPT 检测 -----
 echo -e "   ${YELLOW}检测 ChatGPT...${NC}"
 if [[ $(curl --max-time 10 -sS https://chat.openai.com/ -I 2>/dev/null | grep "text/plain") != "" ]]; then
     stream_results+=("ChatGPT: ❌ IP 被屏蔽")
 else
     countryCode=$(curl --max-time 10 -sS https://chat.openai.com/cdn-cgi/trace 2>/dev/null | grep "loc=" | awk -F= '{print $2}')
     if [ -n "$countryCode" ]; then
-        stream_results+=("ChatGPT: ✅ 可用 (区域: ${countryCode})")
-        stream_score=$((stream_score + 2))
+        stream_results+=("ChatGPT: ✅ 可用 (区域: ${countryCode})"); stream_score=$((stream_score + 2))
     else
         stream_results+=("ChatGPT: ⚠️ 检测失败")
     fi
 fi
 
-# ----- 输出汇总结果 -----
 echo -e "   ${GREEN}流媒体解锁结果:${NC}"
 for result in "${stream_results[@]}"; do
     echo -e "     $result"
 done
-
-# 流媒体总分归一化
-if [[ $stream_score -ge 8 ]]; then
-    score_stream=10
-    stream_desc="流媒体全解锁"
-elif [[ $stream_score -ge 5 ]]; then
-    score_stream=7
-    stream_desc="部分解锁"
-elif [[ $stream_score -ge 2 ]]; then
-    score_stream=4
-    stream_desc="少量解锁"
-else
-    score_stream=1
-    stream_desc="基本不解锁"
-fi
+if [[ $stream_score -ge 8 ]]; then score_stream=10; stream_desc="流媒体全解锁"
+elif [[ $stream_score -ge 5 ]]; then score_stream=7; stream_desc="部分解锁"
+elif [[ $stream_score -ge 2 ]]; then score_stream=4; stream_desc="少量解锁"
+else score_stream=1; stream_desc="基本不解锁"; fi
 echo -e "   流媒体综合得分: ${score_stream}/10 ($stream_desc)"
+
+hw_score=$(awk "BEGIN {printf \"%.1f\", ($cpu_score + $disk_score + $mem_score) / 3}")
+total=$(awk "BEGIN {printf \"%.2f\", (${hw_score})*0.20 + (${score_net})*0.30 + (${score_ip})*0.15 + (${score_stream})*0.10 + (${route_score})*0.20 + (${tiktok_score})*0.05}")
+[[ -z "$total" || "$total" == "0" ]] && total=5.0
+final=$(printf "%.1f" "$total")
 
 echo -e "\n${BLUE}=========================================${NC}"
 echo -e "${BLUE}         🏆 最终体检报告 (v5.2)       ${NC}"
