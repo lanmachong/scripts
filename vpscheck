@@ -203,17 +203,55 @@ echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
 baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.baidu.com 2>/dev/null)
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
-sp=$(timeout 8 curl -o /dev/null -s -w '%{speed_download}' https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent 2>/dev/null)
-if [[ -n "$sp" && "$sp" != "0" ]]; then
-    mbps=$(echo "scale=2; $sp * 8 / 1000000" | bc)
-    if (( $(echo "$mbps > 50" | bc -l) )); then speed_score=10; speed_desc="极速(${mbps}Mbps)"
-    elif (( $(echo "$mbps > 30" | bc -l) )); then speed_score=9; speed_desc="快速(${mbps}Mbps)"
-    elif (( $(echo "$mbps > 15" | bc -l) )); then speed_score=7; speed_desc="中等(${mbps}Mbps)"
-    elif (( $(echo "$mbps > 5" | bc -l) )); then speed_score=5; speed_desc="一般(${mbps}Mbps)"
-    else speed_score=3; speed_desc="低速(${mbps}Mbps)"; fi
+
+# ---- 多源测速，取最大值 ----
+echo -e "   正在从多个节点测速（约12秒）..."
+speed_score=3
+speed_desc="测速失败"
+max_speed=0
+
+# 测速源列表（国外 CDN + 云厂商测速节点）
+test_urls=(
+    "https://cachefly.cachefly.net/100mb.test"
+    "https://speed.cloudflare.com/__down?bytes=100000000"
+    "https://speedtest.sjc2.digitalocean.com/100mb.test"
+    "https://speedtest.ams3.digitalocean.com/100mb.test"
+    "https://speedtest.fra1.digitalocean.com/100mb.test"
+    "https://speedtest.sgp1.digitalocean.com/100mb.test"
+    "https://speedtest.lon1.digitalocean.com/100mb.test"
+    "https://speedtest.nyc3.digitalocean.com/100mb.test"
+    "https://speedtest.ewr.linode.com/100MB-fakefile"
+    "https://speedtest.tokyo.linode.com/100MB-fakefile"
+    "https://speedtest.singapore.linode.com/100MB-fakefile"
+)
+
+for url in "${test_urls[@]}"; do
+    # 测速，只测3秒，取速度
+    sp=$(timeout 4 curl -o /dev/null -s -w '%{speed_download}' "$url" 2>/dev/null)
+    if [[ -n "$sp" && "$sp" != "0" ]]; then
+        # 转成 Mbps
+        mbps=$(echo "scale=2; $sp * 8 / 1000000" | bc 2>/dev/null)
+        # 取最大值
+        if (( $(echo "$mbps > $max_speed" | bc -l 2>/dev/null) )); then
+            max_speed=$mbps
+        fi
+    fi
+done
+
+# 根据最大速度评分
+if [[ -n "$max_speed" && "$max_speed" != "0" ]]; then
+    if (( $(echo "$max_speed > 80" | bc -l) )); then speed_score=10; speed_desc="极速(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 50" | bc -l) )); then speed_score=9; speed_desc="非常快(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 30" | bc -l) )); then speed_score=8; speed_desc="快速(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 15" | bc -l) )); then speed_score=7; speed_desc="良好(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 8" | bc -l) )); then speed_score=5; speed_desc="一般(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 3" | bc -l) )); then speed_score=4; speed_desc="低速(${max_speed}Mbps)"
+    else speed_score=3; speed_desc="极低(${max_speed}Mbps)"
+    fi
 else
-    speed_score=3; speed_desc="测速失败"
+    speed_desc="所有测速源均失败"
 fi
+
 echo -e "   带宽: $speed_desc -> ${speed_score}/10"
 score_net=$(echo "scale=1; $tcp_score * 0.3 + $lat_score * 0.4 + $speed_score * 0.3" | bc)
 
