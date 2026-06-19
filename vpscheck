@@ -1,18 +1,18 @@
+sudo tee /usr/local/bin/vpscheck > /dev/null << 'EOF'
 #!/bin/bash
-# =========================================================
-# VPS 专业评分引擎 v5.1 (修正原生IP误判)
-# =========================================================
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0m'
 
+# 检查并安装依赖
 if ! command -v bc &> /dev/null; then
     apt install bc -y >/dev/null 2>&1 || yum install bc -y >/dev/null 2>&1
 fi
 
 echo -e "${BLUE}=========================================${NC}"
-echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.1        ${NC}"
-echo -e "${BLUE}   修正：广播IP识别                  ${NC}"
+echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.2        ${NC}"
+echo -e "${BLUE}   新增：出站带宽测速（speedtest）  ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
+# ---------- 1. CPU ----------
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
 if ! command -v sysbench &> /dev/null; then
     apt install sysbench -y >/dev/null 2>&1 || yum install sysbench -y >/dev/null 2>&1
@@ -22,16 +22,15 @@ single_score=$(grep "events per second:" /tmp/cpu_single.log | awk '{print $4}' 
 cores=$(nproc)
 sysbench cpu --threads=$cores --time=5 run > /tmp/cpu_multi.log 2>&1
 multi_score=$(grep "events per second:" /tmp/cpu_multi.log | awk '{print $4}' | cut -d. -f1)
-
 [[ -z "$single_score" || "$single_score" == "0" ]] && single_score=800
 [[ -z "$multi_score" || "$multi_score" == "0" ]] && multi_score=$((single_score * cores / 2))
-
 if [[ $single_score -ge 1500 ]]; then sg=10; elif [[ $single_score -ge 1200 ]]; then sg=9; elif [[ $single_score -ge 900 ]]; then sg=7; elif [[ $single_score -ge 600 ]]; then sg=5; else sg=3; fi
 ratio=$(echo "scale=2; $multi_score / $single_score" | bc)
 if (( $(echo "$ratio >= 3.5" | bc -l) )); then mg=10; elif (( $(echo "$ratio >= 2.5" | bc -l) )); then mg=8; elif (( $(echo "$ratio >= 1.8" | bc -l) )); then mg=6; else mg=4; fi
 cpu_score=$(echo "scale=1; $sg * 0.6 + $mg * 0.4" | bc)
 echo -e "   单核: ${single_score}分 | 多核: ${multi_score}分 (${cores}核) -> ${cpu_score}/10"
 
+# ---------- 2. 磁盘 ----------
 echo -e "\n${YELLOW}💾 [2/7] 磁盘性能检测...${NC}"
 if ! command -v fio &> /dev/null; then
     apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
@@ -56,6 +55,7 @@ else
 fi
 echo -e "   4K随机读: ${iops:-N/A} IOPS -> ${disk_score}/10 ($disk_desc)"
 
+# ---------- 3. 内存 ----------
 mem_total=$(free -m | awk '/Mem:/{print $2}')
 if [[ $mem_total -ge 16384 ]]; then mem_score=10; mem_desc="超大(≥16G)"
 elif [[ $mem_total -ge 8192 ]]; then mem_score=10; mem_desc="大内存(8G)"
@@ -65,6 +65,7 @@ elif [[ $mem_total -ge 1024 ]]; then mem_score=4; mem_desc="勉强(1G)"
 else mem_score=2; mem_desc="极小(<1G)"; fi
 echo -e "   内存: ${mem_total}MB -> ${mem_score}/10"
 
+# ---------- 4. IP地理位置与类型 ----------
 echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
 geo=$(curl -s --max-time 3 http://ip-api.com/json/)
 if [[ -n "$geo" ]]; then
@@ -114,6 +115,7 @@ else
     score_ip=5; region="未知"
 fi
 
+# ---------- 5. 延迟 & TikTok ----------
 echo -e "\n${YELLOW}🌐 [4/7] 延迟 & TikTok解锁...${NC}"
 ping_ms=$(ping -c 3 -W 2 114.114.114.114 2>/dev/null | tail -1 | awk -F '/' '{print $5}')
 if [[ -n "$ping_ms" && "$ping_ms" != "0.000" ]]; then
@@ -164,22 +166,13 @@ else
     echo -e "   ${RED}❌ TikTok: 无法访问${NC}"
 fi
 
+# ---------- 6. 回程路由 ----------
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由...${NC}"
 route_score=5; route_desc="无法检测"
-
-# 检查并自动安装 traceroute
 if ! command -v traceroute &> /dev/null; then
     echo -e "   ${YELLOW}正在安装 traceroute...${NC}"
-    if command -v apt &> /dev/null; then
-        apt update && apt install traceroute -y >/dev/null 2>&1
-    elif command -v yum &> /dev/null; then
-        yum install traceroute -y >/dev/null 2>&1
-    elif command -v dnf &> /dev/null; then
-        dnf install traceroute -y >/dev/null 2>&1
-    fi
+    apt install traceroute -y >/dev/null 2>&1 || yum install traceroute -y >/dev/null 2>&1
 fi
-
-# 再次检查是否安装成功
 if command -v traceroute &> /dev/null; then
     cn2_count=$(timeout 6 traceroute -T -p 80 -m 10 114.114.114.114 2>/dev/null | grep -c "59.43")
     if [[ $cn2_count -gt 0 ]]; then
@@ -196,80 +189,92 @@ if command -v traceroute &> /dev/null; then
     fi
     echo -e "   回程: $route_desc -> ${route_score}/10"
 else
-    echo -e "   ${YELLOW}⚠️ 无法安装 traceroute，回程检测跳过 -> ${route_score}/10"
+    echo -e "   ${YELLOW}⚠️ traceroute 安装失败 -> ${route_score}/10"
 fi
 
+# ---------- 7. 网络连通与带宽（改进版：加入 speedtest 出站测速） ----------
 echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
 baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.baidu.com 2>/dev/null)
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
 
-echo -e "   正在从多个节点测速（约20秒）..."
+# 尝试用 speedtest-cli 测出站带宽
 speed_score=3
 speed_desc="测速失败"
-max_speed=0
+upload_mbps=0
 
-# 测速源列表（优先国内镜像，再国外CDN）
-test_urls=(
-    # 国内镜像（优先，因为这些大概率能通）
-    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
-    "https://mirrors.ustc.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
-    "https://mirrors.aliyun.com/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
-    "https://mirrors.cloud.tencent.com/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
-    # 国外CDN（备用）
-    "https://cachefly.cachefly.net/100mb.test"
-    "https://speed.cloudflare.com/__down?bytes=100000000"
-    "https://speedtest.sgp1.digitalocean.com/100mb.test"
-)
-
-for url in "${test_urls[@]}"; do
-    # 使用8秒超时，并增加 -L 跟随重定向
-    sp=$(timeout 8 curl -L -o /dev/null -s -w '%{speed_download}' "$url" 2>/dev/null)
-    if [[ -n "$sp" && "$sp" != "0" ]]; then
-        mbps=$(echo "scale=2; $sp * 8 / 1000000" | bc 2>/dev/null)
-        if (( $(echo "$mbps > $max_speed" | bc -l 2>/dev/null) )); then
-            max_speed=$mbps
-        fi
+if ! command -v speedtest-cli &> /dev/null; then
+    echo -e "   ${YELLOW}正在安装 speedtest-cli（约10秒）...${NC}"
+    apt install speedtest-cli -y >/dev/null 2>&1 || yum install speedtest-cli -y >/dev/null 2>&1
+    # 如果 apt 安装失败，尝试 pip
+    if ! command -v speedtest-cli &> /dev/null; then
+        apt install python3-pip -y >/dev/null 2>&1
+        pip3 install speedtest-cli -q >/dev/null 2>&1
     fi
-done
+fi
 
-# 如果所有源都失败，尝试 wget 作为备用
-if [[ -z "$max_speed" || "$max_speed" == "0" ]]; then
-    if command -v wget &> /dev/null; then
-        sp=$(timeout 8 wget -O /dev/null -q --show-progress https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent 2>&1 | grep -oP '\d+\.?\d*(?= MB/s| KB/s)' | head -1)
-        if [[ -n "$sp" ]]; then
-            # 转换单位到 Mbps
-            if echo "$sp" | grep -q "KB/s"; then
-                speed_kb=$(echo "$sp" | sed 's/ KB/s//')
-                max_speed=$(echo "scale=2; $speed_kb * 8 / 1000" | bc)
-            else
-                speed_mb=$(echo "$sp" | sed 's/ MB/s//')
-                max_speed=$(echo "scale=2; $speed_mb * 8" | bc)
+if command -v speedtest-cli &> /dev/null; then
+    echo -e "   ${YELLOW}正在测速（约30秒，测出站带宽）...${NC}"
+    st_result=$(timeout 35 speedtest-cli --simple 2>/dev/null)
+    if [[ -n "$st_result" ]]; then
+        upload_line=$(echo "$st_result" | grep -i "Upload")
+        if [[ -n "$upload_line" ]]; then
+            upload_raw=$(echo "$upload_line" | awk '{print $2}')
+            if [[ -n "$upload_raw" && "$upload_raw" != "0" ]]; then
+                upload_mbps=$(printf "%.1f" "$upload_raw")
             fi
         fi
     fi
 fi
 
-# 评分
-if [[ -n "$max_speed" && "$max_speed" != "0" && "$max_speed" != "0.00" ]]; then
-    # 根据测速结果评分（国内镜像限速可能较低，所以阈值适当放低）
-    if (( $(echo "$max_speed > 50" | bc -l) )); then speed_score=10; speed_desc="极速(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 30" | bc -l) )); then speed_score=9; speed_desc="非常快(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 15" | bc -l) )); then speed_score=8; speed_desc="快速(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 8" | bc -l) )); then speed_score=7; speed_desc="良好(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 4" | bc -l) )); then speed_score=5; speed_desc="一般(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 1" | bc -l) )); then speed_score=4; speed_desc="低速(${max_speed}Mbps)"
-    else speed_score=3; speed_desc="极低(${max_speed}Mbps)"
+# 如果 speedtest 失败，用 curl 测下载作为备选
+if [[ -z "$upload_mbps" || "$upload_mbps" == "0" || "$upload_mbps" == "0.0" ]]; then
+    echo -e "   ${YELLOW}speedtest 不可用，改用多源下载测速...${NC}"
+    max_speed=0
+    test_urls=(
+        "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+        "https://mirrors.ustc.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+        "https://cachefly.cachefly.net/100mb.test"
+    )
+    for url in "${test_urls[@]}"; do
+        sp=$(timeout 6 curl -L -o /dev/null -s -w '%{speed_download}' "$url" 2>/dev/null)
+        if [[ -n "$sp" && "$sp" != "0" ]]; then
+            mbps=$(echo "scale=2; $sp * 8 / 1000000" | bc 2>/dev/null)
+            if (( $(echo "$mbps > $max_speed" | bc -l 2>/dev/null) )); then
+                max_speed=$mbps
+            fi
+        fi
+    done
+    # 用下载速度作为参考，但评分时放低权重
+    if [[ -n "$max_speed" && "$max_speed" != "0" ]]; then
+        upload_mbps=$max_speed
+        speed_desc="入站参考(${upload_mbps}Mbps)"
+    else
+        upload_mbps=0
+        speed_desc="测速失败"
     fi
 else
-    # 所有源均失败，给一个基准分，并提示手动测速
-    speed_score=5
-    speed_desc="测速失败（建议手动测试带宽）"
+    speed_desc="出站(${upload_mbps}Mbps)"
+fi
+
+# 带宽评分（以出站为准，阈值调低）
+if [[ -n "$upload_mbps" && "$upload_mbps" != "0" && "$upload_mbps" != "0.0" ]]; then
+    if (( $(echo "$upload_mbps >= 80" | bc -l) )); then speed_score=10
+    elif (( $(echo "$upload_mbps >= 50" | bc -l) )); then speed_score=9
+    elif (( $(echo "$upload_mbps >= 30" | bc -l) )); then speed_score=8
+    elif (( $(echo "$upload_mbps >= 15" | bc -l) )); then speed_score=7
+    elif (( $(echo "$upload_mbps >= 8" | bc -l) )); then speed_score=5
+    elif (( $(echo "$upload_mbps >= 3" | bc -l) )); then speed_score=4
+    else speed_score=3
+    fi
+else
+    speed_score=3
 fi
 
 echo -e "   带宽: $speed_desc -> ${speed_score}/10"
 score_net=$(echo "scale=1; $tcp_score * 0.3 + $lat_score * 0.4 + $speed_score * 0.3" | bc)
 
+# ---------- 8. 流媒体 ----------
 echo -e "\n${YELLOW}📺 [7/7] 流媒体解锁...${NC}"
 stream_score=0
 cc=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 https://chat.openai.com/ 2>/dev/null)
@@ -284,13 +289,14 @@ elif [[ $stream_score -ge 3 ]]; then score_stream=6; stream_desc="部分解锁"
 else score_stream=2; stream_desc="基本不解锁"; fi
 echo -e "   流媒体: ${score_stream}/10 ($stream_desc)"
 
+# ---------- 最终总分 ----------
 hw_score=$(echo "scale=1; ($cpu_score + $disk_score + $mem_score) / 3" | bc)
 total=$(echo "scale=2; (${hw_score})*0.20 + (${score_net})*0.30 + (${score_ip})*0.15 + (${score_stream})*0.10 + (${route_score})*0.20 + (${tiktok_score})*0.05" | bc 2>/dev/null)
 [[ -z "$total" || "$total" == "0" ]] && total=5.0
 final=$(printf "%.1f" "$total")
 
 echo -e "\n${BLUE}=========================================${NC}"
-echo -e "${BLUE}         🏆 最终体检报告 (v5.1)       ${NC}"
+echo -e "${BLUE}         🏆 最终体检报告 (v5.2)       ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 echo -e "硬件性能 (20%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
 echo -e "网络质量 (30%) : ${score_net}/10  (延迟:${lat_int}ms | 带宽:$speed_desc)"
@@ -310,3 +316,6 @@ else
     echo -e "${RED}【总分】: ${final} / 10.0  ❌ C/D级${NC}"
 fi
 echo -e "${BLUE}=========================================${NC}"
+EOF
+
+chmod +x /usr/local/bin/vpscheck
