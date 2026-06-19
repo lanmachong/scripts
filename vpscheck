@@ -189,7 +189,6 @@ baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.bai
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
 
-# 尝试用 speedtest-cli 测出站带宽
 speed_score=3
 speed_desc="测速失败"
 upload_mbps=0
