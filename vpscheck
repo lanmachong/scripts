@@ -460,19 +460,34 @@ else score_stream=1; stream_desc="基本不解锁"; fi
 echo -e "   流媒体综合得分: ${score_stream}/10 ($stream_desc)"
 
 hw_score=$(awk "BEGIN {printf \"%.1f\", ($cpu_score + $disk_score + $mem_score) / 3}")
-total=$(awk "BEGIN {printf \"%.2f\", (${hw_score})*0.20 + (${score_net})*0.30 + (${score_ip})*0.15 + (${score_stream})*0.10 + (${route_score})*0.20 + (${tiktok_score})*0.05}")
+
+# TikTok 附加分（不再占用权重）
+tiktok_bonus=0
+if [[ "$tiktok_region" == "US" || "$tiktok_region" == "JP" || "$tiktok_region" == "HK" || "$tiktok_region" == "KR" ]]; then
+    tiktok_bonus=0.2
+elif [[ "$tiktok_score" -gt 0 ]]; then
+    tiktok_bonus=0.1
+fi
+
+total=$(awk "BEGIN {printf \"%.2f\", \
+    (${hw_score})*0.35 + \
+    (${score_net})*0.30 + \
+    (${route_score})*0.15 + \
+    (${score_ip})*0.10 + \
+    (${score_stream})*0.08 + \
+    ${tiktok_bonus}}")
 [[ -z "$total" || "$total" == "0" ]] && total=5.0
 final=$(printf "%.1f" "$total")
 
 echo -e "\n${BLUE}=========================================${NC}"
 echo -e "${BLUE}         🏆 最终体检报告 (v5.2)       ${NC}"
 echo -e "${BLUE}=========================================${NC}"
-echo -e "硬件性能 (20%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
+echo -e "硬件性能 (35%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
 echo -e "网络质量 (30%) : ${score_net}/10  (延迟:${lat_int}ms | 带宽:$speed_desc)"
-echo -e "IP体质   (15%) : ${score_ip}/10  (${region} | ${ip_type})"
-echo -e "流媒体   (10%) : ${score_stream}/10"
-echo -e "回程直连 (20%) : ${route_score}/10"
-echo -e "TikTok   (5%)  : +${tiktok_score}分 (${tiktok_region:-无})"
+echo -e "IP体质   (10%) : ${score_ip}/10  (${region} | ${ip_type})"
+echo -e "流媒体   (8%) : ${score_stream}/10"
+echo -e "回程直连 (15%) : ${route_score}/10"
+echo -e "TikTok   (附加) : +${tiktok_bonus}分 (${tiktok_region:-无})"
 echo -e "-----------------------------------------"
 
 if (( $(echo "$final >= 8.5" | bc -l) )); then
