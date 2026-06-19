@@ -141,22 +141,50 @@ case "$region" in
     *) lat_score=5 ;;
 esac
 echo -e "   延迟: ${lat_int}ms (区域:$region) -> ${lat_score}/10"
+
 echo -e "   TikTok检测中..."
-tiktok_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.tiktok.com/ 2>/dev/null)
-tiktok_score=0; tiktok_region="无"
+tiktok_response=$(curl -sL --max-time 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://www.tiktok.com/" 2>/dev/null)
+tiktok_code=$(echo "$tiktok_response" | head -1 | grep -o "HTTP/.*" | tail -1 | awk '{print $2}' || echo "000")
+if [[ -z "$tiktok_code" || "$tiktok_code" == "000" ]]; then
+    tiktok_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://www.tiktok.com/" 2>/dev/null)
+fi
+
+tiktok_score=0
+tiktok_region="无"
+
 if [[ "$tiktok_code" == "200" ]]; then
-    tiktok_region=$(curl -sL --max-time 5 https://www.tiktok.com/ 2>/dev/null | grep -o 'region":"[^"]*"' | head -1 | cut -d'"' -f4)
-    if [[ -n "$tiktok_region" ]]; then
+    # 尝试提取 region（多种模式）
+    region_patterns=(
+        '"region":"[^"]*"'
+        '"region":"[A-Z]{2}"'
+        'region":"[^"]*"'
+    )
+    for pattern in "${region_patterns[@]}"; do
+        tiktok_region=$(echo "$tiktok_response" | grep -oE "$pattern" | head -1 | cut -d'"' -f4)
+        if [[ -n "$tiktok_region" && "$tiktok_region" != "null" ]]; then
+            break
+        fi
+    done
+
+    # 如果还找不到，尝试从 __INIT_PROPS__ 中提取
+    if [[ -z "$tiktok_region" || "$tiktok_region" == "null" ]]; then
+        tiktok_region=$(echo "$tiktok_response" | grep -oP '(?<=region":")[^"]+' | head -1)
+    fi
+
+    if [[ -n "$tiktok_region" && "$tiktok_region" != "null" && "$tiktok_region" != "undefined" ]]; then
         if [[ "$tiktok_region" == "US" || "$tiktok_region" == "JP" || "$tiktok_region" == "HK" || "$tiktok_region" == "KR" ]]; then
-            tiktok_score=3; echo -e "   ${GREEN}✅ TikTok: 解锁 $tiktok_region 区 (+3分)${NC}"
+            tiktok_score=3
+            echo -e "   ${GREEN}✅ TikTok: 解锁 $tiktok_region 区 (+3分)${NC}"
         else
-            tiktok_score=1; echo -e "   ${YELLOW}⚠️ TikTok: 解锁 $tiktok_region 区 (+1分)${NC}"
+            tiktok_score=1
+            echo -e "   ${YELLOW}⚠️ TikTok: 解锁 $tiktok_region 区 (+1分)${NC}"
         fi
     else
-        tiktok_score=2; echo -e "   ${GREEN}✅ TikTok: 可访问 (区域未知)${NC}"
+        tiktok_score=2
+        echo -e "   ${GREEN}✅ TikTok: 可访问 (区域未知)${NC}"
     fi
 else
-    echo -e "   ${RED}❌ TikTok: 无法访问${NC}"
+    echo -e "   ${RED}❌ TikTok: 无法访问 (HTTP $tiktok_code)${NC}"
 fi
 
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由（多节点检测）...${NC}"
@@ -198,8 +226,9 @@ for node_name in "${!nodes[@]}"; do
     route_output=$(timeout 6 traceroute -T -p 80 -m 15 "$target_ip" 2>/dev/null)
     if [[ -n "$route_output" ]]; then
         detect_success=$((detect_success + 1))
-        # 检测线路特征
-        if echo "$route_output" | grep -qiE "59.43|CN2|CTGNET"; then
+        # 检测线路特征（按优先级从高到低）
+        # 1. 检测 CN2 精品线路（最高优先级）
+        if echo "$route_output" | grep -qiE "59\.43|CTGNET|CN2"; then
             if echo "$route_output" | grep -qiE "GIA"; then
                 cn2gia_count=$((cn2gia_count + 1))
                 route_summary+=("${node_name}: CN2 GIA ✅")
@@ -207,15 +236,18 @@ for node_name in "${!nodes[@]}"; do
                 cn2gt_count=$((cn2gt_count + 1))
                 route_summary+=("${node_name}: CN2 GT ✅")
             fi
-        elif echo "$route_output" | grep -qiE "202.97|163"; then
-            telecom_163=$((telecom_163 + 1))
-            route_summary+=("${node_name}: 163普通线路")
-        elif echo "$route_output" | grep -qiE "4837|AS4837"; then
+        # 2. 检测联通线路（第二优先级，避免被电信关键词误判）
+        elif echo "$route_output" | grep -qiE "AS4837|4837|chinaunicom|CNC"; then
             unicom_4837=$((unicom_4837 + 1))
             route_summary+=("${node_name}: 联通4837")
-        elif echo "$route_output" | grep -qiE "CMI|AS58453|9808"; then
+        # 3. 检测移动线路（第三优先级）
+        elif echo "$route_output" | grep -qiE "AS9808|9808|CMI|AS58453|chinamobile|CMCC"; then
             mobile_cmi=$((mobile_cmi + 1))
             route_summary+=("${node_name}: 移动CMI")
+        # 4. 检测电信163普通线路（最后匹配）
+        elif echo "$route_output" | grep -qiE "202\.97|163"; then
+            telecom_163=$((telecom_163 + 1))
+            route_summary+=("${node_name}: 电信163")
         else
             route_summary+=("${node_name}: 未知线路")
         fi
@@ -233,28 +265,25 @@ if [[ ${#route_summary[@]} -gt 6 ]]; then
 fi
 
 # 综合评分（满分10分）
-# 权重：CN2 GIA 最高，CN2 GT 次之，普通线路基础分
 if [[ $detect_success -eq 0 ]]; then
     route_score=5
     route_desc="所有节点检测失败"
-elif [[ $cn2gia_count -gt 0 ]] && [[ $telecom_163 -eq 0 ]]; then
-    # 有CN2 GIA，且没有163普通线路
+elif [[ $cn2gia_count -gt 0 ]]; then
     route_score=10
     route_desc="CN2 GIA直连（${cn2gia_count}个节点）"
-elif [[ $cn2gia_count -gt 0 ]] && [[ $telecom_163 -gt 0 ]]; then
-    # 有CN2 GIA，但部分走163
-    route_score=8
-    route_desc="混合线路（CN2 GIA + 163）"
-elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -eq 0 ]]; then
-    # 有CN2 GT，没有163
-    route_score=8
-    route_desc="CN2 GT直连（${cn2gt_count}个节点）"
+elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $unicom_4837 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
+    route_score=9
+    route_desc="纯CN2 GT直连（${cn2gt_count}个节点）"
 elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -gt 0 ]]; then
-    # 有CN2 GT，部分走163
     route_score=7
-    route_desc="混合线路（CN2 GT + 163）"
+    route_desc="混合线路（CN2 GT + 电信163）"
+elif [[ $cn2gt_count -gt 0 ]] && [[ $unicom_4837 -gt 0 ]]; then
+    route_score=7
+    route_desc="混合线路（CN2 GT + 联通4837）"
+elif [[ $cn2gt_count -gt 0 ]] && [[ $mobile_cmi -gt 0 ]]; then
+    route_score=7
+    route_desc="混合线路（CN2 GT + 移动CMI）"
 elif [[ $telecom_163 -gt 0 ]] && [[ $unicom_4837 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
-    # 只有电信163
     route_score=6
     route_desc="电信163普通线路"
 elif [[ $unicom_4837 -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
@@ -264,7 +293,6 @@ elif [[ $mobile_cmi -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $unicom_4837 -eq 
     route_score=6
     route_desc="移动CMI普通线路"
 else
-    # 混合普通线路
     route_score=5
     route_desc="多运营商混合线路"
 fi
