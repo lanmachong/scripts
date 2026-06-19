@@ -192,10 +192,11 @@ echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
 sp=$(timeout 8 curl -o /dev/null -s -w '%{speed_download}' https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent 2>/dev/null)
 if [[ -n "$sp" && "$sp" != "0" ]]; then
     mbps=$(echo "scale=2; $sp * 8 / 1000000" | bc)
-    if (( $(echo "$mbps > 100" | bc -l) )); then speed_score=10; speed_desc="极速(${mbps}Mbps)"
-    elif (( $(echo "$mbps > 30" | bc -l) )); then speed_score=8; speed_desc="快速(${mbps}Mbps)"
-    elif (( $(echo "$mbps > 10" | bc -l) )); then speed_score=6; speed_desc="中等(${mbps}Mbps)"
-    else speed_score=4; speed_desc="低速(${mbps}Mbps)"; fi
+    if (( $(echo "$mbps > 50" | bc -l) )); then speed_score=10; speed_desc="极速(${mbps}Mbps)"
+    elif (( $(echo "$mbps > 30" | bc -l) )); then speed_score=9; speed_desc="快速(${mbps}Mbps)"
+    elif (( $(echo "$mbps > 15" | bc -l) )); then speed_score=7; speed_desc="中等(${mbps}Mbps)"
+    elif (( $(echo "$mbps > 5" | bc -l) )); then speed_score=5; speed_desc="一般(${mbps}Mbps)"
+    else speed_score=3; speed_desc="低速(${mbps}Mbps)"; fi
 else
     speed_score=3; speed_desc="测速失败"
 fi
