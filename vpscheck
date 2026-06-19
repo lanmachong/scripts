@@ -137,12 +137,10 @@ for name in "${!delay_nodes[@]}"; do
     ping_result=$(ping -c 1 -W 2 "$ip" 2>/dev/null | grep 'time=' | awk -F 'time=' '{print $2}' | cut -d ' ' -f1)
     
     if [[ -n "$ping_result" ]]; then
-        # 如果ping通，记录延迟，并保留一位小数
         lat=$(printf "%.1f" "$ping_result")
         all_latencies+=("$lat")
         delay_details+=("   ${name}: ${lat}ms")
     else
-        # 如果ping不通，记录为超时
         delay_details+=("   ${name}: 超时")
     fi
 done
@@ -154,14 +152,12 @@ for detail in "${delay_details[@]}"; do
 done
 
 # --- 计算综合延迟评分 ---
-# 如果有成功的ping结果，则计算平均延迟；否则使用基于地理位置的估算值
 if [[ ${#all_latencies[@]} -gt 0 ]]; then
     # 计算平均延迟
     sum=0
     for lat in "${all_latencies[@]}"; do
         sum=$(echo "$sum + $lat" | bc)
     done
-    # 计算平均延迟，保留整数
     lat_int=$(echo "scale=0; $sum / ${#all_latencies[@]}" | bc)
 else
     # 所有节点都ping不通，使用基于地理位置的估算值
@@ -197,10 +193,53 @@ esac
 
 echo -e "   ${GREEN}综合平均延迟: ${lat_int}ms (区域:$region) -> 得分: ${lat_score}/10${NC}"
 
-# --- TikTok检测 (保持不变) ---
-echo -e "   TikTok检测中..."
-# ... (你原有的 TikTok 检测代码保持不变) ...
+# --- TikTok解锁检测（增强版） ---
+echo -e "   ${YELLOW}TikTok检测中...${NC}"
+tiktok_response=$(curl -sL --max-time 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://www.tiktok.com/" 2>/dev/null)
+tiktok_code=$(echo "$tiktok_response" | head -1 | grep -o "HTTP/.*" | tail -1 | awk '{print $2}' || echo "000")
+if [[ -z "$tiktok_code" || "$tiktok_code" == "000" ]]; then
+    tiktok_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://www.tiktok.com/" 2>/dev/null)
+fi
 
+tiktok_score=0
+tiktok_region="无"
+
+if [[ "$tiktok_code" == "200" ]]; then
+    # 尝试多种模式提取 region
+    region_patterns=(
+        '"region":"[^"]*"'
+        '"region":"[A-Z]{2}"'
+        'region":"[^"]*"'
+    )
+    for pattern in "${region_patterns[@]}"; do
+        tiktok_region=$(echo "$tiktok_response" | grep -oE "$pattern" | head -1 | cut -d'"' -f4)
+        if [[ -n "$tiktok_region" && "$tiktok_region" != "null" ]]; then
+            break
+        fi
+    done
+
+    if [[ -z "$tiktok_region" || "$tiktok_region" == "null" ]]; then
+        tiktok_region=$(echo "$tiktok_response" | grep -oP '(?<=region":")[^"]+' | head -1)
+    fi
+
+    if [[ -n "$tiktok_region" && "$tiktok_region" != "null" && "$tiktok_region" != "undefined" ]]; then
+        if [[ "$tiktok_region" == "US" || "$tiktok_region" == "JP" || "$tiktok_region" == "HK" || "$tiktok_region" == "KR" ]]; then
+            tiktok_score=3
+            echo -e "   ${GREEN}✅ TikTok: 解锁 $tiktok_region 区 (+3分)${NC}"
+        else
+            tiktok_score=1
+            echo -e "   ${YELLOW}⚠️ TikTok: 解锁 $tiktok_region 区 (+1分)${NC}"
+        fi
+    else
+        tiktok_score=2
+        echo -e "   ${GREEN}✅ TikTok: 可访问 (区域未知)${NC}"
+    fi
+else
+    echo -e "   ${RED}❌ TikTok: 无法访问 (HTTP $tiktok_code)${NC}"
+fi
+
+# 确保 tiktok_score 至少为0，避免后续计算报错
+[[ -z "$tiktok_score" ]] && tiktok_score=0
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由（多节点检测）...${NC}"
 
 # 安装 traceroute（如果未安装）
