@@ -204,76 +204,72 @@ baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.bai
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
 
-# ---- 多源测速（优化版） ----
 echo -e "   正在从多个节点测速（约20秒）..."
 speed_score=3
 speed_desc="测速失败"
 max_speed=0
-max_source=""
 
-# 测速源列表（按区域分组，优先亚洲）
+# 测速源列表（优先国内镜像，再国外CDN）
 test_urls=(
-    # 亚洲节点（新加坡、东京、香港）
-    "https://speedtest.sgp1.digitalocean.com/100mb.test"
-    "https://speedtest.sgp1.digitalocean.com/100mb.test"
-    "https://speedtest.tokyo.linode.com/100MB-fakefile"
-    "https://speedtest.singapore.linode.com/100MB-fakefile"
-    # 全球 CDN
+    # 国内镜像（优先，因为这些大概率能通）
+    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+    "https://mirrors.ustc.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+    "https://mirrors.aliyun.com/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+    "https://mirrors.cloud.tencent.com/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+    # 国外CDN（备用）
     "https://cachefly.cachefly.net/100mb.test"
     "https://speed.cloudflare.com/__down?bytes=100000000"
-    # 欧美节点（备用）
-    "https://speedtest.sjc2.digitalocean.com/100mb.test"
-    "https://speedtest.ams3.digitalocean.com/100mb.test"
-    "https://speedtest.fra1.digitalocean.com/100mb.test"
-    "https://speedtest.lon1.digitalocean.com/100mb.test"
-    "https://speedtest.nyc3.digitalocean.com/100mb.test"
-    "https://speedtest.ewr.linode.com/100MB-fakefile"
+    "https://speedtest.sgp1.digitalocean.com/100mb.test"
 )
 
 for url in "${test_urls[@]}"; do
-    # 延长超时到 6 秒，让下载更完整
-    sp=$(timeout 6 curl -o /dev/null -s -w '%{speed_download}' "$url" 2>/dev/null)
+    # 使用8秒超时，并增加 -L 跟随重定向
+    sp=$(timeout 8 curl -L -o /dev/null -s -w '%{speed_download}' "$url" 2>/dev/null)
     if [[ -n "$sp" && "$sp" != "0" ]]; then
-        # 转成 Mbps
         mbps=$(echo "scale=2; $sp * 8 / 1000000" | bc 2>/dev/null)
-        # 检查是否大于当前最大值
         if (( $(echo "$mbps > $max_speed" | bc -l 2>/dev/null) )); then
             max_speed=$mbps
-            max_source="$url"
         fi
     fi
 done
 
-# 如果所有源都失败，尝试用 wget 再测一次（有些环境 curl 可能受限）
+# 如果所有源都失败，尝试 wget 作为备用
 if [[ -z "$max_speed" || "$max_speed" == "0" ]]; then
-    # 使用 wget 再试一个最可靠的源
     if command -v wget &> /dev/null; then
-        sp=$(timeout 6 wget -O /dev/null -q --show-progress https://speedtest.sgp1.digitalocean.com/100mb.test 2>&1 | grep -oP '\d+\.?\d*' | tail -1)
-        if [[ -n "$sp" && "$sp" != "0" ]]; then
-            max_speed=$(echo "scale=2; $sp * 8 / 1000000" | bc 2>/dev/null)
-            max_source="wget fallback"
+        sp=$(timeout 8 wget -O /dev/null -q --show-progress https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent 2>&1 | grep -oP '\d+\.?\d*(?= MB/s| KB/s)' | head -1)
+        if [[ -n "$sp" ]]; then
+            # 转换单位到 Mbps
+            if echo "$sp" | grep -q "KB/s"; then
+                speed_kb=$(echo "$sp" | sed 's/ KB/s//')
+                max_speed=$(echo "scale=2; $speed_kb * 8 / 1000" | bc)
+            else
+                speed_mb=$(echo "$sp" | sed 's/ MB/s//')
+                max_speed=$(echo "scale=2; $speed_mb * 8" | bc)
+            fi
         fi
     fi
 fi
 
-# 根据最大速度评分
+# 评分
 if [[ -n "$max_speed" && "$max_speed" != "0" && "$max_speed" != "0.00" ]]; then
-    if (( $(echo "$max_speed > 80" | bc -l) )); then speed_score=10; speed_desc="极速(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 50" | bc -l) )); then speed_score=9; speed_desc="非常快(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 30" | bc -l) )); then speed_score=8; speed_desc="快速(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 15" | bc -l) )); then speed_score=7; speed_desc="良好(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 8" | bc -l) )); then speed_score=5; speed_desc="一般(${max_speed}Mbps)"
-    elif (( $(echo "$max_speed > 3" | bc -l) )); then speed_score=4; speed_desc="低速(${max_speed}Mbps)"
+    # 根据测速结果评分（国内镜像限速可能较低，所以阈值适当放低）
+    if (( $(echo "$max_speed > 50" | bc -l) )); then speed_score=10; speed_desc="极速(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 30" | bc -l) )); then speed_score=9; speed_desc="非常快(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 15" | bc -l) )); then speed_score=8; speed_desc="快速(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 8" | bc -l) )); then speed_score=7; speed_desc="良好(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 4" | bc -l) )); then speed_score=5; speed_desc="一般(${max_speed}Mbps)"
+    elif (( $(echo "$max_speed > 1" | bc -l) )); then speed_score=4; speed_desc="低速(${max_speed}Mbps)"
     else speed_score=3; speed_desc="极低(${max_speed}Mbps)"
     fi
 else
-    # 全部失败，给一个基础分并提示
-    speed_score=3
-    speed_desc="测速失败（建议手动测试）"
+    # 所有源均失败，给一个基准分，并提示手动测速
+    speed_score=5
+    speed_desc="测速失败（建议手动测试带宽）"
 fi
 
 echo -e "   带宽: $speed_desc -> ${speed_score}/10"
 score_net=$(echo "scale=1; $tcp_score * 0.3 + $lat_score * 0.4 + $speed_score * 0.3" | bc)
+
 echo -e "\n${YELLOW}📺 [7/7] 流媒体解锁...${NC}"
 stream_score=0
 cc=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 https://chat.openai.com/ 2>/dev/null)
