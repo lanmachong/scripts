@@ -1,11 +1,9 @@
 > #!/bin/bash
 > # =========================================================
 > # VPS 专业评分引擎 v5.1 (修正原生IP误判)
-> # 修复：ASN注册国 vs 当前位置 判断广播IP
 > # =========================================================
 > RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0m'
 > 
-> # 检查bc
 > if ! command -v bc &> /dev/null; then
 >     apt install bc -y >/dev/null 2>&1 || yum install bc -y >/dev/null 2>&1
 > fi
@@ -15,7 +13,6 @@
 > echo -e "${BLUE}   修正：广播IP识别                  ${NC}"
 > echo -e "${BLUE}=========================================${NC}"
 > 
-> # ---------- 1. CPU 评分 ----------
 > echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
 > if ! command -v sysbench &> /dev/null; then
 >     apt install sysbench -y >/dev/null 2>&1 || yum install sysbench -y >/dev/null 2>&1
@@ -35,7 +32,6 @@
 > cpu_score=$(echo "scale=1; $sg * 0.6 + $mg * 0.4" | bc)
 > echo -e "   单核: ${single_score}分 | 多核: ${multi_score}分 (${cores}核) -> ${cpu_score}/10"
 > 
-> # ---------- 2. 磁盘评分 ----------
 > echo -e "\n${YELLOW}💾 [2/7] 磁盘性能检测...${NC}"
 > if ! command -v fio &> /dev/null; then
 >     apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
@@ -50,18 +46,16 @@
 >     elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
 >     elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
 >     else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
-OW}🌐 [4/> else
+> else
 >     dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
 >     rm -f /tmp/test
 >     if [[ ${dd_out%.*} -ge 1000 ]]; then disk_score=9; disk_desc="极速(${dd_out}MB/s)"
 >     elif [[ ${dd_out%.*} -ge 400 ]]; then disk_score=7; disk_desc="高速(${dd_out}MB/s)"
 >     elif [[ ${dd_out%.*} -ge 150 ]]; then disk_score=5; disk_desc="普通SSD(${dd_out}MB/s)"
 >     else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
-�")
-        if [[ $lat_int -le> fi
+> fi
 > echo -e "   4K随机读: ${iops:-N/A} IOPS -> ${disk_score}/10 ($disk_desc)"
 > 
-> # ---------- 3. 内存评分 ----------
 > mem_total=$(free -m | awk '/Mem:/{print $2}')
 > if [[ $mem_total -ge 16384 ]]; then mem_score=10; mem_desc="超大(≥16G)"
 > elif [[ $mem_total -ge 8192 ]]; then mem_score=10; mem_desc="大内存(8G)"
@@ -71,7 +65,6 @@ OW}🌐 [4/> else
 > else mem_score=2; mem_desc="极小(<1G)"; fi
 > echo -e "   内存: ${mem_total}MB -> ${mem_score}/10"
 > 
-�> # ---------- 4. IP地理位置与类型（修正版） ----------
 > echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
 > geo=$(curl -s --max-time 3 http://ip-api.com/json/)
 > if [[ -n "$geo" ]]; then
@@ -79,44 +72,32 @@ OW}🌐 [4/> else
 >     city=$(echo "$geo" | grep -o '"city":"[^"]*"' | head -1 | cut -d'"' -f4)
 >     isp=$(echo "$geo" | grep -o '"isp":"[^"]*"' | head -1 | cut -d'"' -f4)
 >     as_info=$(echo "$geo" | grep -o '"as":"[^"]*"' | head -1 | cut -d'"' -f4)
->     
 >     echo -e "   位置: $country - $city | 运营商: $isp"
 >     echo -e "   ASN信息: $as_info"
-> 
->     ip_type="未知"
->     ip_bonus=0
+>     ip_type="未知"; ip_bonus=0
 >     country_code=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
 >     as_org=$(echo "$as_info" | sed 's/^AS[0-9]* //')
->     
-i>     if echo "$as_org" | grep -qiE "HK|Hong Kong|Japan|Singapore|Korea|Taiwan|China|CN"; then
+>     if echo "$as_org" | grep -qiE "HK|Hong Kong|Japan|Singapore|Korea|Taiwan|China|CN"; then
 >         if [[ "$country_code" == "HK" || "$country_code" == "JP" || "$country_code" == "SG" || "$country_code" == "KR" || "$country_code" == "TW" || "$country_code" == "CN" ]]; then
->             ip_type="原生IP ✓ (ASN注册地与位置一致)"
->             ip_bonus=2
+>             ip_type="原生IP ✓ (ASN注册地与位置一致)"; ip_bonus=2
 >         else
->             ip_type="广播IP (ASN亚洲但位置在非亚洲)"
->             ip_bonus=0
+>             ip_type="广播IP (ASN亚洲但位置在非亚洲)"; ip_bonus=0
 >         fi
 >     elif echo "$as_org" | grep -qiE "INC|LLC|Corp|US|United States|America"; then
 >         if [[ "$country_code" == "US" ]]; then
->             ip_type="原生IP ✓ (ASN美国且位置在美国)"
->             ip_bonus=2
+>             ip_type="原生IP ✓ (ASN美国且位置在美国)"; ip_bonus=2
 >         else
->             ip_type="广播IP (ASN注册在美国，但IP在当前地区)"
->             ip_bonus=0
+>             ip_type="广播IP (ASN注册在美国，但IP在当前地区)"; ip_bonus=0
 >         fi
 >     else
 >         reg=$(curl -s --max-time 3 https://ipinfo.io/country 2>/dev/null)
 >         if [[ -n "$reg" && "$reg" == "$country_code" ]]; then
->             ip_type="可能原生 (位置与注册国一致)"
->             ip_bonus=1
+>             ip_type="可能原生 (位置与注册国一致)"; ip_bonus=1
 >         else
->             ip_type="可能广播 (位置与注册国不一致)"
->             ip_bonus=0
+>             ip_type="可能广播 (位置与注册国不一致)"; ip_bonus=0
 >         fi
 >     fi
->     
-�>     echo -e "   IP类型: $ip_type ($([ $ip_bonus -gt 0 ] && echo "+${ip_bonus}分" || echo "不加分"))"
->     
+>     echo -e "   IP类型: $ip_type ($([ $ip_bonus -gt 0 ] && echo "+${ip_bonus}分" || echo "不加分"))"
 >     if [[ "$country" == "Hong Kong" || "$country" == "Japan" || "$country" == "Singapore" || "$country" == "South Korea" || "$country" == "Taiwan" ]]; then
 >         base_ip=9; region="亚洲"
 >     elif [[ "$country" == "United States" ]]; then
@@ -133,7 +114,6 @@ i>     if echo "$as_org" | grep -qiE "HK|Hong Kong|Japan|Singapore|Korea|Taiwan|
 >     score_ip=5; region="未知"
 > fi
 > 
-e> # ---------- 5. 延迟 & TikTok ----------
 > echo -e "\n${YELLOW}🌐 [4/7] 延迟 & TikTok解锁...${NC}"
 > ping_ms=$(ping -c 3 -W 2 114.114.114.114 2>/dev/null | tail -1 | awk -F '/' '{print $5}')
 > if [[ -n "$ping_ms" && "$ping_ms" != "0.000" ]]; then
@@ -145,17 +125,16 @@ e> # ---------- 5. 延迟 & TikTok ----------
 >         "美东/中部") lat_int=240 ;;
 >         "欧洲") lat_int=260 ;;
 >         *) lat_int=200 ;;
-core >     esac
+>     esac
 > fi
-> 
-[> case "$region" in
+> case "$region" in
 >     "亚洲")
 >         if [[ $lat_int -le 60 ]]; then lat_score=10
 >         elif [[ $lat_int -le 100 ]]; then lat_score=8
 >         elif [[ $lat_int -le 150 ]]; then lat_score=6
 >         else lat_score=3; fi ;;
 >     "美西")
-utu>         if [[ $lat_int -le 150 ]]; then lat_score=10
+>         if [[ $lat_int -le 150 ]]; then lat_score=10
 >         elif [[ $lat_int -le 180 ]]; then lat_score=8
 >         elif [[ $lat_int -le 220 ]]; then lat_score=6
 >         else lat_score=3; fi ;;
@@ -167,8 +146,7 @@ utu>         if [[ $lat_int -le 150 ]]; then lat_score=10
 >     *) lat_score=5 ;;
 > esac
 > echo -e "   延迟: ${lat_int}ms (区域:$region) -> ${lat_score}/10"
-> 
-1> echo -e "   TikTok检测中..."
+> echo -e "   TikTok检测中..."
 > tiktok_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.tiktok.com/ 2>/dev/null)
 > tiktok_score=0; tiktok_region="无"
 > if [[ "$tiktok_code" == "200" ]]; then
@@ -185,8 +163,7 @@ utu>         if [[ $lat_int -le 150 ]]; then lat_score=10
 > else
 >     echo -e "   ${RED}❌ TikTok: 无法访问${NC}"
 > fi
-> 
-> # ---------- 6. 回程路由 ----------
+��> 
 > echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由...${NC}"
 > route_score=5; route_desc="无法检测"
 > if command -v traceroute &> /dev/null; then
@@ -208,12 +185,10 @@ utu>         if [[ $lat_int -le 150 ]]; then lat_score=10
 >     echo -e "   ${YELLOW}回程检测工具未安装 -> ${route_score}/10"
 > fi
 > 
-> # ---------- 7. 网络连通与带宽 ----------
 > echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
 > baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.baidu.com 2>/dev/null)
 > [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 > echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
-> 
 > sp=$(timeout 8 curl -o /dev/null -s -w '%{speed_download}' https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent 2>/dev/null)
 > if [[ -n "$sp" && "$sp" != "0" ]]; then
 >     mbps=$(echo "scale=2; $sp * 8 / 1000000" | bc)
@@ -227,7 +202,6 @@ utu>         if [[ $lat_int -le 150 ]]; then lat_score=10
 > echo -e "   带宽: $speed_desc -> ${speed_score}/10"
 > score_net=$(echo "scale=1; $tcp_score * 0.3 + $lat_score * 0.4 + $speed_score * 0.3" | bc)
 > 
-> # ---------- 8. 流媒体 ----------
 > echo -e "\n${YELLOW}📺 [7/7] 流媒体解锁...${NC}"
 > stream_score=0
 > cc=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 https://chat.openai.com/ 2>/dev/null)
@@ -242,7 +216,6 @@ utu>         if [[ $lat_int -le 150 ]]; then lat_score=10
 > else score_stream=2; stream_desc="基本不解锁"; fi
 > echo -e "   流媒体: ${score_stream}/10 ($stream_desc)"
 > 
-> # ---------- 最终总分 ----------
 > hw_score=$(echo "scale=1; ($cpu_score + $disk_score + $mem_score) / 3" | bc)
 > total=$(echo "scale=2; (${hw_score})*0.20 + (${score_net})*0.30 + (${score_ip})*0.15 + (${score_stream})*0.10 + (${route_score})*0.20 + (${tiktok_score})*0.05" | bc 2>/dev/null)
 > [[ -z "$total" || "$total" == "0" ]] && total=5.0
@@ -270,15 +243,19 @@ utu>         if [[ $lat_int -le 150 ]]; then lat_score=10
 > fi
 > echo -e "${BLUE}=========================================${NC}"
 > EOF
-root@ser8262865520:~# cat /tmp/vpscheck_correct.sh
+root@ser8262865520:~# head -5 /tmp/vpscheck_clean.sh
 #!/bin/bash
 # =========================================================
 # VPS 专业评分引擎 v5.1 (修正原生IP误判)
-# 修复：ASN注册国 vs 当前位置 判断广播IP
+# =========================================================
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0m'
+root@ser8262865520:~# cat /tmp/vpscheck_clean.sh
+#!/bin/bash
+# =========================================================
+# VPS 专业评分引擎 v5.1 (修正原生IP误判)
 # =========================================================
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0m'
 
-# 检查bc
 if ! command -v bc &> /dev/null; then
     apt install bc -y >/dev/null 2>&1 || yum install bc -y >/dev/null 2>&1
 fi
@@ -288,7 +265,6 @@ echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.1        ${NC}"
 echo -e "${BLUE}   修正：广播IP识别                  ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
-# ---------- 1. CPU 评分 ----------
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
 if ! command -v sysbench &> /dev/null; then
     apt install sysbench -y >/dev/null 2>&1 || yum install sysbench -y >/dev/null 2>&1
@@ -308,7 +284,6 @@ if (( $(echo "$ratio >= 3.5" | bc -l) )); then mg=10; elif (( $(echo "$ratio >= 
 cpu_score=$(echo "scale=1; $sg * 0.6 + $mg * 0.4" | bc)
 echo -e "   单核: ${single_score}分 | 多核: ${multi_score}分 (${cores}核) -> ${cpu_score}/10"
 
-# ---------- 2. 磁盘评分 ----------
 echo -e "\n${YELLOW}💾 [2/7] 磁盘性能检测...${NC}"
 if ! command -v fio &> /dev/null; then
     apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
@@ -333,7 +308,6 @@ else
 fi
 echo -e "   4K随机读: ${iops:-N/A} IOPS -> ${disk_score}/10 ($disk_desc)"
 
-# ---------- 3. 内存评分 ----------
 mem_total=$(free -m | awk '/Mem:/{print $2}')
 if [[ $mem_total -ge 16384 ]]; then mem_score=10; mem_desc="超大(≥16G)"
 elif [[ $mem_total -ge 8192 ]]; then mem_score=10; mem_desc="大内存(8G)"
@@ -343,7 +317,6 @@ elif [[ $mem_total -ge 1024 ]]; then mem_score=4; mem_desc="勉强(1G)"
 else mem_score=2; mem_desc="极小(<1G)"; fi
 echo -e "   内存: ${mem_total}MB -> ${mem_score}/10"
 
-# ---------- 4. IP地理位置与类型（修正版） ----------
 echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
 geo=$(curl -s --max-time 3 http://ip-api.com/json/)
 if [[ -n "$geo" ]]; then
@@ -351,44 +324,32 @@ if [[ -n "$geo" ]]; then
     city=$(echo "$geo" | grep -o '"city":"[^"]*"' | head -1 | cut -d'"' -f4)
     isp=$(echo "$geo" | grep -o '"isp":"[^"]*"' | head -1 | cut -d'"' -f4)
     as_info=$(echo "$geo" | grep -o '"as":"[^"]*"' | head -1 | cut -d'"' -f4)
-    
     echo -e "   位置: $country - $city | 运营商: $isp"
     echo -e "   ASN信息: $as_info"
-
-    ip_type="未知"
-    ip_bonus=0
+    ip_type="未知"; ip_bonus=0
     country_code=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
     as_org=$(echo "$as_info" | sed 's/^AS[0-9]* //')
-    
     if echo "$as_org" | grep -qiE "HK|Hong Kong|Japan|Singapore|Korea|Taiwan|China|CN"; then
         if [[ "$country_code" == "HK" || "$country_code" == "JP" || "$country_code" == "SG" || "$country_code" == "KR" || "$country_code" == "TW" || "$country_code" == "CN" ]]; then
-            ip_type="原生IP ✓ (ASN注册地与位置一致)"
-            ip_bonus=2
+            ip_type="原生IP ✓ (ASN注册地与位置一致)"; ip_bonus=2
         else
-            ip_type="广播IP (ASN亚洲但位置在非亚洲)"
-            ip_bonus=0
+            ip_type="广播IP (ASN亚洲但位置在非亚洲)"; ip_bonus=0
         fi
     elif echo "$as_org" | grep -qiE "INC|LLC|Corp|US|United States|America"; then
         if [[ "$country_code" == "US" ]]; then
-            ip_type="原生IP ✓ (ASN美国且位置在美国)"
-            ip_bonus=2
+            ip_type="原生IP ✓ (ASN美国且位置在美国)"; ip_bonus=2
         else
-            ip_type="广播IP (ASN注册在美国，但IP在当前地区)"
-            ip_bonus=0
+            ip_type="广播IP (ASN注册在美国，但IP在当前地区)"; ip_bonus=0
         fi
     else
         reg=$(curl -s --max-time 3 https://ipinfo.io/country 2>/dev/null)
         if [[ -n "$reg" && "$reg" == "$country_code" ]]; then
-            ip_type="可能原生 (位置与注册国一致)"
-            ip_bonus=1
+            ip_type="可能原生 (位置与注册国一致)"; ip_bonus=1
         else
-            ip_type="可能广播 (位置与注册国不一致)"
-            ip_bonus=0
+            ip_type="可能广播 (位置与注册国不一致)"; ip_bonus=0
         fi
     fi
-    
     echo -e "   IP类型: $ip_type ($([ $ip_bonus -gt 0 ] && echo "+${ip_bonus}分" || echo "不加分"))"
-    
     if [[ "$country" == "Hong Kong" || "$country" == "Japan" || "$country" == "Singapore" || "$country" == "South Korea" || "$country" == "Taiwan" ]]; then
         base_ip=9; region="亚洲"
     elif [[ "$country" == "United States" ]]; then
@@ -405,7 +366,6 @@ else
     score_ip=5; region="未知"
 fi
 
-# ---------- 5. 延迟 & TikTok ----------
 echo -e "\n${YELLOW}🌐 [4/7] 延迟 & TikTok解锁...${NC}"
 ping_ms=$(ping -c 3 -W 2 114.114.114.114 2>/dev/null | tail -1 | awk -F '/' '{print $5}')
 if [[ -n "$ping_ms" && "$ping_ms" != "0.000" ]]; then
@@ -419,7 +379,6 @@ else
         *) lat_int=200 ;;
     esac
 fi
-
 case "$region" in
     "亚洲")
         if [[ $lat_int -le 60 ]]; then lat_score=10
@@ -439,7 +398,6 @@ case "$region" in
     *) lat_score=5 ;;
 esac
 echo -e "   延迟: ${lat_int}ms (区域:$region) -> ${lat_score}/10"
-
 echo -e "   TikTok检测中..."
 tiktok_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.tiktok.com/ 2>/dev/null)
 tiktok_score=0; tiktok_region="无"
@@ -458,7 +416,6 @@ else
     echo -e "   ${RED}❌ TikTok: 无法访问${NC}"
 fi
 
-# ---------- 6. 回程路由 ----------
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由...${NC}"
 route_score=5; route_desc="无法检测"
 if command -v traceroute &> /dev/null; then
@@ -480,12 +437,10 @@ else
     echo -e "   ${YELLOW}回程检测工具未安装 -> ${route_score}/10"
 fi
 
-# ---------- 7. 网络连通与带宽 ----------
 echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
 baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.baidu.com 2>/dev/null)
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
-
 sp=$(timeout 8 curl -o /dev/null -s -w '%{speed_download}' https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent 2>/dev/null)
 if [[ -n "$sp" && "$sp" != "0" ]]; then
     mbps=$(echo "scale=2; $sp * 8 / 1000000" | bc)
@@ -499,7 +454,6 @@ fi
 echo -e "   带宽: $speed_desc -> ${speed_score}/10"
 score_net=$(echo "scale=1; $tcp_score * 0.3 + $lat_score * 0.4 + $speed_score * 0.3" | bc)
 
-# ---------- 8. 流媒体 ----------
 echo -e "\n${YELLOW}📺 [7/7] 流媒体解锁...${NC}"
 stream_score=0
 cc=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 https://chat.openai.com/ 2>/dev/null)
@@ -514,7 +468,6 @@ elif [[ $stream_score -ge 3 ]]; then score_stream=6; stream_desc="部分解锁"
 else score_stream=2; stream_desc="基本不解锁"; fi
 echo -e "   流媒体: ${score_stream}/10 ($stream_desc)"
 
-# ---------- 最终总分 ----------
 hw_score=$(echo "scale=1; ($cpu_score + $disk_score + $mem_score) / 3" | bc)
 total=$(echo "scale=2; (${hw_score})*0.20 + (${score_net})*0.30 + (${score_ip})*0.15 + (${score_stream})*0.10 + (${route_score})*0.20 + (${tiktok_score})*0.05" | bc 2>/dev/null)
 [[ -z "$total" || "$total" == "0" ]] && total=5.0
