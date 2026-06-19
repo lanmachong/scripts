@@ -1,8 +1,6 @@
-sudo tee /usr/local/bin/vpscheck > /dev/null << 'EOF'
 #!/bin/bash
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0m'
 
-# 检查并安装依赖
 if ! command -v bc &> /dev/null; then
     apt install bc -y >/dev/null 2>&1 || yum install bc -y >/dev/null 2>&1
 fi
@@ -12,7 +10,6 @@ echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.2        ${NC}"
 echo -e "${BLUE}   新增：出站带宽测速（speedtest）  ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
-# ---------- 1. CPU ----------
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
 if ! command -v sysbench &> /dev/null; then
     apt install sysbench -y >/dev/null 2>&1 || yum install sysbench -y >/dev/null 2>&1
@@ -30,7 +27,6 @@ if (( $(echo "$ratio >= 3.5" | bc -l) )); then mg=10; elif (( $(echo "$ratio >= 
 cpu_score=$(echo "scale=1; $sg * 0.6 + $mg * 0.4" | bc)
 echo -e "   单核: ${single_score}分 | 多核: ${multi_score}分 (${cores}核) -> ${cpu_score}/10"
 
-# ---------- 2. 磁盘 ----------
 echo -e "\n${YELLOW}💾 [2/7] 磁盘性能检测...${NC}"
 if ! command -v fio &> /dev/null; then
     apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
@@ -55,7 +51,6 @@ else
 fi
 echo -e "   4K随机读: ${iops:-N/A} IOPS -> ${disk_score}/10 ($disk_desc)"
 
-# ---------- 3. 内存 ----------
 mem_total=$(free -m | awk '/Mem:/{print $2}')
 if [[ $mem_total -ge 16384 ]]; then mem_score=10; mem_desc="超大(≥16G)"
 elif [[ $mem_total -ge 8192 ]]; then mem_score=10; mem_desc="大内存(8G)"
@@ -65,7 +60,6 @@ elif [[ $mem_total -ge 1024 ]]; then mem_score=4; mem_desc="勉强(1G)"
 else mem_score=2; mem_desc="极小(<1G)"; fi
 echo -e "   内存: ${mem_total}MB -> ${mem_score}/10"
 
-# ---------- 4. IP地理位置与类型 ----------
 echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
 geo=$(curl -s --max-time 3 http://ip-api.com/json/)
 if [[ -n "$geo" ]]; then
@@ -115,7 +109,6 @@ else
     score_ip=5; region="未知"
 fi
 
-# ---------- 5. 延迟 & TikTok ----------
 echo -e "\n${YELLOW}🌐 [4/7] 延迟 & TikTok解锁...${NC}"
 ping_ms=$(ping -c 3 -W 2 114.114.114.114 2>/dev/null | tail -1 | awk -F '/' '{print $5}')
 if [[ -n "$ping_ms" && "$ping_ms" != "0.000" ]]; then
@@ -166,7 +159,6 @@ else
     echo -e "   ${RED}❌ TikTok: 无法访问${NC}"
 fi
 
-# ---------- 6. 回程路由 ----------
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由...${NC}"
 route_score=5; route_desc="无法检测"
 if ! command -v traceroute &> /dev/null; then
@@ -192,7 +184,6 @@ else
     echo -e "   ${YELLOW}⚠️ traceroute 安装失败 -> ${route_score}/10"
 fi
 
-# ---------- 7. 网络连通与带宽（改进版：加入 speedtest 出站测速） ----------
 echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
 baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.baidu.com 2>/dev/null)
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
@@ -206,7 +197,6 @@ upload_mbps=0
 if ! command -v speedtest-cli &> /dev/null; then
     echo -e "   ${YELLOW}正在安装 speedtest-cli（约10秒）...${NC}"
     apt install speedtest-cli -y >/dev/null 2>&1 || yum install speedtest-cli -y >/dev/null 2>&1
-    # 如果 apt 安装失败，尝试 pip
     if ! command -v speedtest-cli &> /dev/null; then
         apt install python3-pip -y >/dev/null 2>&1
         pip3 install speedtest-cli -q >/dev/null 2>&1
@@ -227,7 +217,6 @@ if command -v speedtest-cli &> /dev/null; then
     fi
 fi
 
-# 如果 speedtest 失败，用 curl 测下载作为备选
 if [[ -z "$upload_mbps" || "$upload_mbps" == "0" || "$upload_mbps" == "0.0" ]]; then
     echo -e "   ${YELLOW}speedtest 不可用，改用多源下载测速...${NC}"
     max_speed=0
@@ -245,7 +234,6 @@ if [[ -z "$upload_mbps" || "$upload_mbps" == "0" || "$upload_mbps" == "0.0" ]]; 
             fi
         fi
     done
-    # 用下载速度作为参考，但评分时放低权重
     if [[ -n "$max_speed" && "$max_speed" != "0" ]]; then
         upload_mbps=$max_speed
         speed_desc="入站参考(${upload_mbps}Mbps)"
@@ -257,7 +245,6 @@ else
     speed_desc="出站(${upload_mbps}Mbps)"
 fi
 
-# 带宽评分（以出站为准，阈值调低）
 if [[ -n "$upload_mbps" && "$upload_mbps" != "0" && "$upload_mbps" != "0.0" ]]; then
     if (( $(echo "$upload_mbps >= 80" | bc -l) )); then speed_score=10
     elif (( $(echo "$upload_mbps >= 50" | bc -l) )); then speed_score=9
@@ -274,7 +261,6 @@ fi
 echo -e "   带宽: $speed_desc -> ${speed_score}/10"
 score_net=$(echo "scale=1; $tcp_score * 0.3 + $lat_score * 0.4 + $speed_score * 0.3" | bc)
 
-# ---------- 8. 流媒体 ----------
 echo -e "\n${YELLOW}📺 [7/7] 流媒体解锁...${NC}"
 stream_score=0
 cc=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 https://chat.openai.com/ 2>/dev/null)
@@ -289,7 +275,6 @@ elif [[ $stream_score -ge 3 ]]; then score_stream=6; stream_desc="部分解锁"
 else score_stream=2; stream_desc="基本不解锁"; fi
 echo -e "   流媒体: ${score_stream}/10 ($stream_desc)"
 
-# ---------- 最终总分 ----------
 hw_score=$(echo "scale=1; ($cpu_score + $disk_score + $mem_score) / 3" | bc)
 total=$(echo "scale=2; (${hw_score})*0.20 + (${score_net})*0.30 + (${score_ip})*0.15 + (${score_stream})*0.10 + (${route_score})*0.20 + (${tiktok_score})*0.05" | bc 2>/dev/null)
 [[ -z "$total" || "$total" == "0" ]] && total=5.0
@@ -316,6 +301,3 @@ else
     echo -e "${RED}【总分】: ${final} / 10.0  ❌ C/D级${NC}"
 fi
 echo -e "${BLUE}=========================================${NC}"
-EOF
-
-chmod +x /usr/local/bin/vpscheck
