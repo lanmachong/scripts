@@ -166,6 +166,20 @@ fi
 
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由...${NC}"
 route_score=5; route_desc="无法检测"
+
+# 检查并自动安装 traceroute
+if ! command -v traceroute &> /dev/null; then
+    echo -e "   ${YELLOW}正在安装 traceroute...${NC}"
+    if command -v apt &> /dev/null; then
+        apt update && apt install traceroute -y >/dev/null 2>&1
+    elif command -v yum &> /dev/null; then
+        yum install traceroute -y >/dev/null 2>&1
+    elif command -v dnf &> /dev/null; then
+        dnf install traceroute -y >/dev/null 2>&1
+    fi
+fi
+
+# 再次检查是否安装成功
 if command -v traceroute &> /dev/null; then
     cn2_count=$(timeout 6 traceroute -T -p 80 -m 10 114.114.114.114 2>/dev/null | grep -c "59.43")
     if [[ $cn2_count -gt 0 ]]; then
@@ -182,7 +196,7 @@ if command -v traceroute &> /dev/null; then
     fi
     echo -e "   回程: $route_desc -> ${route_score}/10"
 else
-    echo -e "   ${YELLOW}回程检测工具未安装 -> ${route_score}/10"
+    echo -e "   ${YELLOW}⚠️ 无法安装 traceroute，回程检测跳过 -> ${route_score}/10"
 fi
 
 echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
