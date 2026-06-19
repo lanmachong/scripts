@@ -159,30 +159,117 @@ else
     echo -e "   ${RED}❌ TikTok: 无法访问${NC}"
 fi
 
-echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由...${NC}"
-route_score=5; route_desc="无法检测"
+echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由（多节点检测）...${NC}"
+
+# 安装 traceroute（如果未安装）
 if ! command -v traceroute &> /dev/null; then
     echo -e "   ${YELLOW}正在安装 traceroute...${NC}"
     apt install traceroute -y >/dev/null 2>&1 || yum install traceroute -y >/dev/null 2>&1
 fi
-if command -v traceroute &> /dev/null; then
-    cn2_count=$(timeout 6 traceroute -T -p 80 -m 10 114.114.114.114 2>/dev/null | grep -c "59.43")
-    if [[ $cn2_count -gt 0 ]]; then
-        route_score=10; route_desc="电信CN2/GIA直连"
-    else
-        tel_hops=$(timeout 6 traceroute -T -p 80 -m 10 114.114.114.114 2>/dev/null | grep -c "ms")
-        if [[ $tel_hops -le 8 ]]; then
-            route_score=8; route_desc="电信163直连(低跳数)"
-        elif [[ $tel_hops -le 12 ]]; then
-            route_score=6; route_desc="普通直连"
+
+# 检测节点列表（国内三网代表性城市）
+declare -A nodes=(
+    ["北京电信"]="219.141.140.10"
+    ["上海电信"]="202.96.209.133"
+    ["广州电信"]="58.60.188.222"
+    ["成都电信"]="61.139.2.69"
+    ["北京联通"]="202.106.195.68"
+    ["上海联通"]="210.22.97.1"
+    ["广州移动"]="120.196.165.24"
+    ["成都移动"]="211.137.96.205"
+)
+
+# 评分变量
+cn2_count=0
+cn2gt_count=0
+cn2gia_count=0
+telecom_163=0
+unicom_4837=0
+mobile_cmi=0
+detect_total=0
+detect_success=0
+route_summary=()
+
+echo -e "   ${YELLOW}正在检测多节点回程路由...${NC}"
+
+for node_name in "${!nodes[@]}"; do
+    target_ip="${nodes[$node_name]}"
+    # 超时6秒，追踪15跳
+    route_output=$(timeout 6 traceroute -T -p 80 -m 15 "$target_ip" 2>/dev/null)
+    if [[ -n "$route_output" ]]; then
+        detect_success=$((detect_success + 1))
+        # 检测线路特征
+        if echo "$route_output" | grep -qiE "59.43|CN2|CTGNET"; then
+            if echo "$route_output" | grep -qiE "GIA"; then
+                cn2gia_count=$((cn2gia_count + 1))
+                route_summary+=("${node_name}: CN2 GIA ✅")
+            else
+                cn2gt_count=$((cn2gt_count + 1))
+                route_summary+=("${node_name}: CN2 GT ✅")
+            fi
+        elif echo "$route_output" | grep -qiE "202.97|163"; then
+            telecom_163=$((telecom_163 + 1))
+            route_summary+=("${node_name}: 163普通线路")
+        elif echo "$route_output" | grep -qiE "4837|AS4837"; then
+            unicom_4837=$((unicom_4837 + 1))
+            route_summary+=("${node_name}: 联通4837")
+        elif echo "$route_output" | grep -qiE "CMI|AS58453|9808"; then
+            mobile_cmi=$((mobile_cmi + 1))
+            route_summary+=("${node_name}: 移动CMI")
         else
-            route_score=4; route_desc="绕路(跳数>12)"
+            route_summary+=("${node_name}: 未知线路")
         fi
+        detect_total=$((detect_total + 1))
     fi
-    echo -e "   回程: $route_desc -> ${route_score}/10"
-else
-    echo -e "   ${YELLOW}⚠️ traceroute 安装失败 -> ${route_score}/10"
+done
+
+# 显示检测结果摘要（只显示前5个，避免刷屏）
+echo -e "   ${GREEN}检测结果摘要:${NC}"
+for ((i=0; i<${#route_summary[@]} && i<6; i++)); do
+    echo -e "     ${route_summary[$i]}"
+done
+if [[ ${#route_summary[@]} -gt 6 ]]; then
+    echo -e "     ... 共 ${#route_summary[@]} 个节点"
 fi
+
+# 综合评分（满分10分）
+# 权重：CN2 GIA 最高，CN2 GT 次之，普通线路基础分
+if [[ $detect_success -eq 0 ]]; then
+    route_score=5
+    route_desc="所有节点检测失败"
+elif [[ $cn2gia_count -gt 0 ]] && [[ $telecom_163 -eq 0 ]]; then
+    # 有CN2 GIA，且没有163普通线路
+    route_score=10
+    route_desc="CN2 GIA直连（${cn2gia_count}个节点）"
+elif [[ $cn2gia_count -gt 0 ]] && [[ $telecom_163 -gt 0 ]]; then
+    # 有CN2 GIA，但部分走163
+    route_score=8
+    route_desc="混合线路（CN2 GIA + 163）"
+elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -eq 0 ]]; then
+    # 有CN2 GT，没有163
+    route_score=8
+    route_desc="CN2 GT直连（${cn2gt_count}个节点）"
+elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -gt 0 ]]; then
+    # 有CN2 GT，部分走163
+    route_score=7
+    route_desc="混合线路（CN2 GT + 163）"
+elif [[ $telecom_163 -gt 0 ]] && [[ $unicom_4837 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
+    # 只有电信163
+    route_score=6
+    route_desc="电信163普通线路"
+elif [[ $unicom_4837 -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
+    route_score=6
+    route_desc="联通4837普通线路"
+elif [[ $mobile_cmi -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $unicom_4837 -eq 0 ]]; then
+    route_score=6
+    route_desc="移动CMI普通线路"
+else
+    # 混合普通线路
+    route_score=5
+    route_desc="多运营商混合线路"
+fi
+
+echo -e "   回程综合评分: ${route_score}/10 (${route_desc})"
 
 echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
 baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.baidu.com 2>/dev/null)
