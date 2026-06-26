@@ -495,6 +495,11 @@ elif [[ $stream_score -ge 2 ]]; then score_stream=4; stream_desc="少量解锁"
 else score_stream=1; stream_desc="基本不解锁"; fi
 echo -e "   流媒体综合得分: ${score_stream}/10 ($stream_desc)"
 
+# 确保所有硬件变量都有值
+[[ -z "$cpu_score" ]] && cpu_score=0
+[[ -z "$disk_score" ]] && disk_score=0
+[[ -z "$mem_score" ]] && mem_score=1
+
 hw_score=$(awk "BEGIN {printf \"%.1f\", ($cpu_score + $disk_score + $mem_score) / 3}")
 
 # TikTok 附加分
