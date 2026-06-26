@@ -95,6 +95,7 @@ else
     else mem_score=1; mem_desc="极小(<1G)"; fi
 fi
 echo -e "   内存: ${mem_total:-0}MB -> ${mem_score}/10 ($mem_desc)"
+
 echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
 geo=$(curl -s --max-time 3 http://ip-api.com/json/)
 if [[ -n "$geo" ]]; then
@@ -102,46 +103,79 @@ if [[ -n "$geo" ]]; then
     city=$(echo "$geo" | grep -o '"city":"[^"]*"' | head -1 | cut -d'"' -f4)
     isp=$(echo "$geo" | grep -o '"isp":"[^"]*"' | head -1 | cut -d'"' -f4)
     as_info=$(echo "$geo" | grep -o '"as":"[^"]*"' | head -1 | cut -d'"' -f4)
+    country_code=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
     echo -e "   位置: $country - $city | 运营商: $isp"
     echo -e "   ASN信息: $as_info"
-    ip_type="未知"; ip_bonus=0
-    country_code=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
+    
+    ip_type="未知"
+    ip_bonus=0
     as_org=$(echo "$as_info" | sed 's/^AS[0-9]* //')
+    
     if echo "$as_org" | grep -qiE "HK|Hong Kong|Japan|Singapore|Korea|Taiwan|China|CN"; then
         if [[ "$country_code" == "HK" || "$country_code" == "JP" || "$country_code" == "SG" || "$country_code" == "KR" || "$country_code" == "TW" || "$country_code" == "CN" ]]; then
-            ip_type="原生IP ✓ (ASN注册地与位置一致)"; ip_bonus=2
+            ip_type="原生IP ✓ (ASN注册地与位置一致)"
+            ip_bonus=2
         else
-            ip_type="广播IP (ASN亚洲但位置在非亚洲)"; ip_bonus=0
+            ip_type="广播IP (ASN亚洲但位置在非亚洲)"
+            ip_bonus=0
         fi
     elif echo "$as_org" | grep -qiE "INC|LLC|Corp|US|United States|America"; then
         if [[ "$country_code" == "US" ]]; then
-            ip_type="原生IP ✓ (ASN美国且位置在美国)"; ip_bonus=2
+            ip_type="原生IP ✓ (ASN美国且位置在美国)"
+            ip_bonus=2
         else
-            ip_type="广播IP (ASN注册在美国，但IP在当前地区)"; ip_bonus=0
+            ip_type="广播IP (ASN注册在美国，但IP在当前地区)"
+            ip_bonus=0
         fi
     else
         reg=$(curl -s --max-time 3 https://ipinfo.io/country 2>/dev/null)
         if [[ -n "$reg" && "$reg" == "$country_code" ]]; then
-            ip_type="可能原生 (位置与注册国一致)"; ip_bonus=1
+            ip_type="可能原生 (位置与注册国一致)"
+            ip_bonus=1
         else
-            ip_type="可能广播 (位置与注册国不一致)"; ip_bonus=0
+            ip_type="可能广播 (位置与注册国不一致)"
+            ip_bonus=0
         fi
     fi
+    
     echo -e "   IP类型: $ip_type ($([ $ip_bonus -gt 0 ] && echo "+${ip_bonus}分" || echo "不加分"))"
+    
+    # 设置 region（确保赋值）
     if [[ "$country" == "Hong Kong" || "$country" == "Japan" || "$country" == "Singapore" || "$country" == "South Korea" || "$country" == "Taiwan" ]]; then
-        base_ip=9; region="亚洲"
+        base_ip=9
+        region="亚洲"
     elif [[ "$country" == "United States" ]]; then
         if [[ "$city" == "Los Angeles" || "$city" == "San Jose" || "$city" == "Seattle" ]]; then
-            base_ip=7; region="美西"
-        else base_ip=5; region="美东/中部"; fi
+            base_ip=7
+            region="美西"
+        else
+            base_ip=5
+            region="美东/中部"
+        fi
     elif [[ "$country" == "Germany" || "$country" == "Netherlands" || "$country" == "United Kingdom" ]]; then
-        base_ip=3; region="欧洲"
-    else base_ip=5; region="其他"; fi
+        base_ip=3
+        region="欧洲"
+    elif [[ "$country" == "Malaysia" || "$country" == "Vietnam" || "$country" == "Thailand" || "$country" == "Indonesia" || "$country" == "Philippines" ]]; then
+        base_ip=6
+        region="亚洲"  # 东南亚也归为亚洲
+    else
+        base_ip=5
+        region="其他"
+    fi
+    
     score_ip=$((base_ip + ip_bonus))
     [[ $score_ip -gt 10 ]] && score_ip=10
     echo -e "   体质: ${score_ip}/10 ($region) [基础分:$base_ip + 类型加分:$ip_bonus]"
 else
-    score_ip=5; region="未知"
+    # geo 获取失败，设置默认值
+    country="未知"
+    city="未知"
+    isp="未知"
+    country_code=""
+    score_ip=5
+    region="其他"
+    ip_type="无法检测"
+    echo -e "   ${YELLOW}⚠️ 无法获取IP地理位置信息，使用默认值${NC}"
 fi
 
 echo -e "\n${YELLOW}🌐 [4/7] 延迟 & TikTok解锁...${NC}"
@@ -228,9 +262,18 @@ else
     tiktok_score=0
     tiktok_region="无"
     if [[ "$tiktok_code" == "200" ]]; then
-        tiktok_region=$(echo "$tiktok_response" | grep -oE '"region":"[^"]*"' | head -1 | cut -d'"' -f4)
+        # 提取 region（多种模式）
+        tiktok_region=$(echo "$tiktok_response" | grep -oE '"region":"[A-Z]{2,5}"' | head -1 | cut -d'"' -f4)
         if [[ -z "$tiktok_region" || "$tiktok_region" == "null" ]]; then
-            tiktok_region=$(echo "$tiktok_response" | grep -oP '(?<=region":")[^"]+' | head -1)
+            tiktok_region=$(echo "$tiktok_response" | grep -oP '(?<=region":")[A-Z]{2,5}' | head -1)
+        fi
+        # 过滤无效区域（如 ALISG、AWS 等云服务商标识）
+        if [[ -n "$tiktok_region" ]]; then
+            case "$tiktok_region" in
+                ALISG|AWS|AZURE|GCP|CLOUDFLARE|UNKNOWN)
+                    tiktok_region=""
+                    ;;
+            esac
         fi
         if [[ -n "$tiktok_region" && "$tiktok_region" != "null" && "$tiktok_region" != "undefined" ]]; then
             if [[ "$tiktok_region" == "US" || "$tiktok_region" == "JP" || "$tiktok_region" == "HK" || "$tiktok_region" == "KR" ]]; then
@@ -251,7 +294,6 @@ else
 fi
 [[ -z "$tiktok_score" ]] && tiktok_score=0
 [[ -z "$tiktok_region" ]] && tiktok_region="无"
-
 
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由（多节点检测）...${NC}"
 if ! command -v traceroute &> /dev/null; then
