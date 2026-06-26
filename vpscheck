@@ -28,37 +28,73 @@ cpu_score=$(echo "scale=1; $sg * 0.6 + $mg * 0.4" | bc)
 echo -e "   单核: ${single_score}分 | 多核: ${multi_score}分 (${cores}核) -> ${cpu_score}/10"
 
 echo -e "\n${YELLOW}💾 [2/7] 磁盘性能检测...${NC}"
-if ! command -v fio &> /dev/null; then
-    apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
-fi
-fio --name=4k_read --directory=/tmp --size=128M --bs=4k --rw=randread --ioengine=libaio --direct=1 --numjobs=1 --iodepth=32 --time_based --runtime=6 --group_reporting > /tmp/fio.log 2>&1
-iops=$(grep -oP 'iops=\K[0-9]+' /tmp/fio.log | head -1)
-rm -f /tmp/4k_read* 2>/dev/null
-if [[ -n "$iops" && "$iops" -gt 0 ]]; then
-    if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
-    elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
-    elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
-    elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
-    elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
-    else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
-else
+disk_score=0
+iops="N/A"
+
+# 检查内存大小，小于1GB跳过fio直接使用dd
+mem_total_for_check=$(free -m | awk '/Mem:/{print $2}')
+if [[ $mem_total_for_check -lt 768 ]]; then
+    echo -e "   ${YELLOW}⚠️ 内存较小 (${mem_total_for_check}MB)，跳过 fio 4K 测试，使用 dd 测速${NC}"
     dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
     rm -f /tmp/test
     if [[ ${dd_out%.*} -ge 1000 ]]; then disk_score=9; disk_desc="极速(${dd_out}MB/s)"
     elif [[ ${dd_out%.*} -ge 400 ]]; then disk_score=7; disk_desc="高速(${dd_out}MB/s)"
     elif [[ ${dd_out%.*} -ge 150 ]]; then disk_score=5; disk_desc="普通SSD(${dd_out}MB/s)"
     else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
-fi
-echo -e "   4K随机读: ${iops:-N/A} IOPS -> ${disk_score}/10 ($disk_desc)"
+    echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
+else
+    # 内存充足，正常执行 fio 测试
+    if ! command -v fio &> /dev/null; then
+        apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
+    fi
+    echo -e "   ${YELLOW}正在测试4K随机读写性能...${NC}"
+    fio_output=$(timeout 10 fio --name=4k_read --directory=/tmp --size=128M --bs=4k --rw=randread --ioengine=libaio --direct=1 --numjobs=1 --iodepth=32 --time_based --runtime=6 --group_reporting 2>&1)
+    fio_exit_code=$?
+    rm -f /tmp/4k_read* 2>/dev/null
 
-mem_total=$(free -m | awk '/Mem:/{print $2}')
-if [[ $mem_total -ge 16384 ]]; then mem_score=10; mem_desc="超大(≥16G)"
-elif [[ $mem_total -ge 8192 ]]; then mem_score=10; mem_desc="大内存(8G)"
-elif [[ $mem_total -ge 4096 ]]; then mem_score=9; mem_desc="充足(4G)"
-elif [[ $mem_total -ge 2048 ]]; then mem_score=7; mem_desc="够用(2G)"
-elif [[ $mem_total -ge 1024 ]]; then mem_score=4; mem_desc="勉强(1G)"
-else mem_score=2; mem_desc="极小(<1G)"; fi
-echo -e "   内存: ${mem_total}MB -> ${mem_score}/10"
+    if [[ $fio_exit_code -eq 137 ]] || [[ $fio_exit_code -eq 139 ]]; then
+        # 被 OOM Killer 杀掉或段错误，降级到 dd
+        echo -e "   ${YELLOW}⚠️ 4K测试被系统终止，改用 dd 测速${NC}"
+        dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
+        rm -f /tmp/test
+        if [[ ${dd_out%.*} -ge 1000 ]]; then disk_score=9; disk_desc="极速(${dd_out}MB/s)"
+        elif [[ ${dd_out%.*} -ge 400 ]]; then disk_score=7; disk_desc="高速(${dd_out}MB/s)"
+        elif [[ ${dd_out%.*} -ge 150 ]]; then disk_score=5; disk_desc="普通SSD(${dd_out}MB/s)"
+        else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
+        echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
+    elif [[ -n "$fio_output" ]] && [[ $fio_exit_code -eq 0 ]]; then
+        # fio 正常执行，提取 IOPS
+        iops=$(echo "$fio_output" | grep -oP 'iops=\K[0-9]+' | head -1)
+        if [[ -n "$iops" && "$iops" -gt 0 ]]; then
+            if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
+            elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
+            elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
+            elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
+            elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
+            else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
+        else
+            # fio 执行了但没提取到 IOPS，降级到 dd
+            echo -e "   ${YELLOW}⚠️ 无法提取 IOPS，改用 dd 测速${NC}"
+            dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
+            rm -f /tmp/test
+            if [[ ${dd_out%.*} -ge 1000 ]]; then disk_score=9; disk_desc="极速(${dd_out}MB/s)"
+            elif [[ ${dd_out%.*} -ge 400 ]]; then disk_score=7; disk_desc="高速(${dd_out}MB/s)"
+            elif [[ ${dd_out%.*} -ge 150 ]]; then disk_score=5; disk_desc="普通SSD(${dd_out}MB/s)"
+            else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
+        fi
+        echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
+    else
+        # fio 完全失败，降级到 dd
+        echo -e "   ${YELLOW}⚠️ fio 测试异常，改用 dd 测速${NC}"
+        dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
+        rm -f /tmp/test
+        if [[ ${dd_out%.*} -ge 1000 ]]; then disk_score=9; disk_desc="极速(${dd_out}MB/s)"
+        elif [[ ${dd_out%.*} -ge 400 ]]; then disk_score=7; disk_desc="高速(${dd_out}MB/s)"
+        elif [[ ${dd_out%.*} -ge 150 ]]; then disk_score=5; disk_desc="普通SSD(${dd_out}MB/s)"
+        else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
+        echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
+    fi
+fi
 
 echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
 geo=$(curl -s --max-time 3 http://ip-api.com/json/)
