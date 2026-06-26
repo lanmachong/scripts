@@ -32,65 +32,52 @@ echo -e "\n${YELLOW}💾 [2/7] 磁盘与内存性能检测...${NC}"
 # ==================== 磁盘检测 ====================
 disk_score=0
 iops="N/A"
-mem_total_for_check=$(free -m | awk '/Mem:/{print $2}')
 
-# 内存小于768MB：无法有效跑fio，给1分
-if [[ $mem_total_for_check -lt 768 ]]; then
-    echo -e "   ${YELLOW}⚠️ 内存较小 (${mem_total_for_check}MB)，无法运行 4K 测试，磁盘得分 1 分${NC}"
+# 直接尝试 fio 测试（不管内存大小，先试了再说）
+if ! command -v fio &> /dev/null; then
+    apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
+fi
+
+echo -e "   ${YELLOW}正在测试4K随机读写性能...${NC}"
+fio_output=$(timeout 10 fio --name=4k_read --directory=/tmp --size=128M --bs=4k --rw=randread --ioengine=libaio --direct=1 --numjobs=1 --iodepth=32 --time_based --runtime=6 --group_reporting 2>&1)
+fio_exit_code=$?
+rm -f /tmp/4k_read* 2>/dev/null
+
+# fio 执行失败或被终止
+if [[ $fio_exit_code -ne 0 ]] || [[ -z "$fio_output" ]]; then
+    echo -e "   ${YELLOW}⚠️ fio 测试失败，磁盘得分 1 分${NC}"
     disk_score=1
-    echo -e "   磁盘: 无法测试(内存不足) -> ${disk_score}/10"
+    echo -e "   磁盘: 测试失败 -> ${disk_score}/10"
 else
-    # 内存充足，执行 fio 测试
-    if ! command -v fio &> /dev/null; then
-        apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
-    fi
-    echo -e "   ${YELLOW}正在测试4K随机读写性能...${NC}"
-    fio_output=$(timeout 10 fio --name=4k_read --directory=/tmp --size=128M --bs=4k --rw=randread --ioengine=libaio --direct=1 --numjobs=1 --iodepth=32 --time_based --runtime=6 --group_reporting 2>&1)
-    fio_exit_code=$?
-    rm -f /tmp/4k_read* 2>/dev/null
-
-    # fio 被系统终止（OOM/段错误）
-    if [[ $fio_exit_code -eq 137 ]] || [[ $fio_exit_code -eq 139 ]]; then
-        echo -e "   ${YELLOW}⚠️ fio 测试被系统终止，磁盘得分 1 分${NC}"
-        disk_score=1
-        echo -e "   磁盘: 测试异常 -> ${disk_score}/10"
-    # fio 执行成功
-    elif [[ -n "$fio_output" ]] && [[ $fio_exit_code -eq 0 ]]; then
-        # 从 "read: IOPS=126k" 提取 IOPS（处理 k 单位）
-        iops_raw=$(echo "$fio_output" | grep -oE 'read:.*IOPS=[0-9.]+[kK]?' | head -1 | grep -oE '[0-9.]+[kK]?' | head -1)
-        if [[ -n "$iops_raw" ]]; then
-            if [[ "$iops_raw" =~ [kK]$ ]]; then
-                iops_num=$(echo "$iops_raw" | sed 's/[kK]$//')
-                iops=$(printf "%.0f" "$(echo "$iops_num * 1000" | bc)")
-            else
-                iops=$(printf "%.0f" "$iops_raw")
-            fi
-        fi
-        # 备选：从汇总行 "iops : avg=xxx" 提取
-        if [[ -z "$iops" || "$iops" == "0" ]]; then
-            iops=$(echo "$fio_output" | grep -oE 'iops[[:space:]]*:[[:space:]]*.*avg=[0-9.]+' | grep -oE 'avg=[0-9.]+' | head -1 | cut -d= -f2 | cut -d. -f1)
-        fi
-
-        # IOPS 有效且大于500，正常评分
-        if [[ -n "$iops" && "$iops" -gt 500 ]]; then
-            if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
-            elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
-            elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
-            elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
-            elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
-            else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
-            echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
+    # 从 "read: IOPS=126k" 提取 IOPS（处理 k 单位）
+    iops_raw=$(echo "$fio_output" | grep -oE 'read:.*IOPS=[0-9.]+[kK]?' | head -1 | grep -oE '[0-9.]+[kK]?' | head -1)
+    if [[ -n "$iops_raw" ]]; then
+        if [[ "$iops_raw" =~ [kK]$ ]]; then
+            iops_num=$(echo "$iops_raw" | sed 's/[kK]$//')
+            iops=$(printf "%.0f" "$(echo "$iops_num * 1000" | bc 2>/dev/null)")
         else
-            # IOPS 无效或异常低，给1分
-            echo -e "   ${YELLOW}⚠️ 无法获取有效 IOPS，磁盘得分 1 分${NC}"
-            disk_score=1
-            echo -e "   磁盘: 无法获取有效数据 -> ${disk_score}/10"
+            iops=$(printf "%.0f" "$iops_raw")
         fi
+    fi
+    # 备选：从汇总行 "iops : avg=xxx" 提取
+    if [[ -z "$iops" || "$iops" == "0" ]]; then
+        iops=$(echo "$fio_output" | grep -oE 'iops[[:space:]]*:[[:space:]]*.*avg=[0-9.]+' | grep -oE 'avg=[0-9.]+' | head -1 | cut -d= -f2 | cut -d. -f1)
+    fi
+
+    # IOPS 有效且大于 500，正常评分
+    if [[ -n "$iops" && "$iops" -gt 500 ]]; then
+        if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
+        elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
+        elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
+        elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
+        elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
+        else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
+        echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
     else
-        # fio 完全失败，给1分
-        echo -e "   ${YELLOW}⚠️ fio 测试异常，磁盘得分 1 分${NC}"
+        # IOPS 无效，给 1 分
+        echo -e "   ${YELLOW}⚠️ 无法获取有效 IOPS，磁盘得分 1 分${NC}"
         disk_score=1
-        echo -e "   磁盘: 测试异常 -> ${disk_score}/10"
+        echo -e "   磁盘: 无有效数据 -> ${disk_score}/10"
     fi
 fi
 
@@ -108,7 +95,6 @@ else
     else mem_score=1; mem_desc="极小(<1G)"; fi
 fi
 echo -e "   内存: ${mem_total:-0}MB -> ${mem_score}/10 ($mem_desc)"
-
 echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
 geo=$(curl -s --max-time 3 http://ip-api.com/json/)
 if [[ -n "$geo" ]]; then
