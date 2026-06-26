@@ -55,6 +55,7 @@ else
     rm -f /tmp/4k_read* 2>/dev/null
 
     if [[ $fio_exit_code -eq 137 ]] || [[ $fio_exit_code -eq 139 ]]; then
+        # 被 OOM Killer 杀掉或段错误，降级到 dd
         echo -e "   ${YELLOW}⚠️ 4K测试被系统终止，改用 dd 测速${NC}"
         dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
         rm -f /tmp/test
@@ -64,23 +65,18 @@ else
         else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
         echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
     elif [[ -n "$fio_output" ]] && [[ $fio_exit_code -eq 0 ]]; then
-        iops=""
+        # 尝试提取 IOPS 和带宽（BW）
         iops=$(echo "$fio_output" | grep -oE 'iops=[0-9]+' | head -1 | cut -d= -f2)
         if [[ -z "$iops" ]]; then
             iops=$(echo "$fio_output" | grep -oE 'IOPS=[0-9]+' | head -1 | cut -d= -f2)
         fi
-        if [[ -z "$iops" ]]; then
-            iops=$(echo "$fio_output" | grep -oE 'iops [0-9]+' | head -1 | awk '{print $2}')
+        # 如果 IOPS 提取失败或小于 500，视为提取异常，改用 dd
+        if [[ -n "$iops" && "$iops" -lt 500 ]]; then
+            echo -e "   ${YELLOW}⚠️ IOPS 值异常 (${iops})，改用 dd 测速${NC}"
+            iops=""
         fi
-        if [[ -n "$iops" && "$iops" -gt 100 ]]; then
-            if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
-            elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
-            elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
-            elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
-            elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
-            else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
-            echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
-        else
+        if [[ -z "$iops" ]]; then
+            # 无法提取有效 IOPS，降级到 dd
             echo -e "   ${YELLOW}⚠️ 无法获取有效 IOPS，改用 dd 测速${NC}"
             dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
             rm -f /tmp/test
@@ -89,8 +85,18 @@ else
             elif [[ ${dd_out%.*} -ge 150 ]]; then disk_score=5; disk_desc="普通SSD(${dd_out}MB/s)"
             else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
             echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
+        else
+            # IOPS 有效，按 4K 随机读评分
+            if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
+            elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
+            elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
+            elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
+            elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
+            else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
+            echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
         fi
     else
+        # fio 完全失败，降级到 dd
         echo -e "   ${YELLOW}⚠️ fio 测试异常，改用 dd 测速${NC}"
         dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
         rm -f /tmp/test
