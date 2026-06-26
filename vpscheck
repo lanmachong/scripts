@@ -31,7 +31,7 @@ echo -e "\n${YELLOW}💾 [2/7] 磁盘性能检测...${NC}"
 disk_score=0
 iops="N/A"
 
-# 检查内存大小，小于1GB跳过fio直接使用dd
+# 检查内存大小，小于768MB跳过fio直接使用dd
 mem_total_for_check=$(free -m | awk '/Mem:/{print $2}')
 if [[ $mem_total_for_check -lt 768 ]]; then
     echo -e "   ${YELLOW}⚠️ 内存较小 (${mem_total_for_check}MB)，跳过 fio 4K 测试，使用 dd 测速${NC}"
@@ -66,12 +66,14 @@ else
         # fio 正常执行，提取 IOPS
         iops=$(echo "$fio_output" | grep -oP 'iops=\K[0-9]+' | head -1)
         if [[ -n "$iops" && "$iops" -gt 0 ]]; then
+            # 成功提取 IOPS，按 4K 随机读评分
             if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
             elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
             elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
             elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
             elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
             else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
+            echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
         else
             # fio 执行了但没提取到 IOPS，降级到 dd
             echo -e "   ${YELLOW}⚠️ 无法提取 IOPS，改用 dd 测速${NC}"
@@ -81,8 +83,8 @@ else
             elif [[ ${dd_out%.*} -ge 400 ]]; then disk_score=7; disk_desc="高速(${dd_out}MB/s)"
             elif [[ ${dd_out%.*} -ge 150 ]]; then disk_score=5; disk_desc="普通SSD(${dd_out}MB/s)"
             else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
+            echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
         fi
-        echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
     else
         # fio 完全失败，降级到 dd
         echo -e "   ${YELLOW}⚠️ fio 测试异常，改用 dd 测速${NC}"
@@ -95,6 +97,21 @@ else
         echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
     fi
 fi
+
+echo -e "\n${YELLOW}🧠 内存性能检测...${NC}"
+mem_total=$(free -m | awk '/Mem:/{print $2}')
+if [[ -z "$mem_total" || "$mem_total" == "0" ]]; then
+    mem_score=1
+    mem_desc="无法检测(给最低分)"
+else
+    if [[ $mem_total -ge 16384 ]]; then mem_score=10; mem_desc="超大(≥16G)"
+    elif [[ $mem_total -ge 8192 ]]; then mem_score=10; mem_desc="大内存(8G)"
+    elif [[ $mem_total -ge 4096 ]]; then mem_score=9; mem_desc="充足(4G)"
+    elif [[ $mem_total -ge 2048 ]]; then mem_score=7; mem_desc="够用(2G)"
+    elif [[ $mem_total -ge 1024 ]]; then mem_score=4; mem_desc="勉强(1G)"
+    else mem_score=1; mem_desc="极小(<1G)"; fi
+fi
+echo -e "   内存: ${mem_total:-0}MB -> ${mem_score}/10 ($mem_desc)"
 
 echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
 geo=$(curl -s --max-time 3 http://ip-api.com/json/)
@@ -236,10 +253,10 @@ else
         if [[ -n "$tiktok_region" && "$tiktok_region" != "null" && "$tiktok_region" != "undefined" ]]; then
             if [[ "$tiktok_region" == "US" || "$tiktok_region" == "JP" || "$tiktok_region" == "HK" || "$tiktok_region" == "KR" ]]; then
                 tiktok_score=3
-                echo -e "   ${GREEN}✅ TikTok: 解锁 $tiktok_region 区 (+3分)${NC}"
+                echo -e "   ${GREEN}✅ TikTok: 解锁 $tiktok_region 区${NC}"
             else
                 tiktok_score=1
-                echo -e "   ${YELLOW}⚠️ TikTok: 解锁 $tiktok_region 区 (+1分)${NC}"
+                echo -e "   ${YELLOW}⚠️ TikTok: 解锁 $tiktok_region 区${NC}"
             fi
         else
             tiktok_score=2
@@ -252,6 +269,7 @@ else
 fi
 [[ -z "$tiktok_score" ]] && tiktok_score=0
 [[ -z "$tiktok_region" ]] && tiktok_region="无"
+
 
 echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由（多节点检测）...${NC}"
 if ! command -v traceroute &> /dev/null; then
