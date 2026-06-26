@@ -104,11 +104,11 @@ if [[ -z "$mem_total" || "$mem_total" == "0" ]]; then
     mem_score=1
     mem_desc="无法检测(给最低分)"
 else
-    if [[ $mem_total -ge 16384 ]]; then mem_score=10; mem_desc="超大(≥16G)"
-    elif [[ $mem_total -ge 8192 ]]; then mem_score=10; mem_desc="大内存(8G)"
-    elif [[ $mem_total -ge 4096 ]]; then mem_score=9; mem_desc="充足(4G)"
-    elif [[ $mem_total -ge 2048 ]]; then mem_score=7; mem_desc="够用(2G)"
-    elif [[ $mem_total -ge 1024 ]]; then mem_score=4; mem_desc="勉强(1G)"
+    if [[ $mem_total -ge 14000 ]]; then mem_score=10; mem_desc="超大(≥16G)"
+    elif [[ $mem_total -ge 7000 ]]; then mem_score=9; mem_desc="大内存(8G)"
+    elif [[ $mem_total -ge 3500 ]]; then mem_score=7; mem_desc="充足(4G)"
+    elif [[ $mem_total -ge 1800 ]]; then mem_score=5; mem_desc="够用(2G)"
+    elif [[ $mem_total -ge 900 ]]; then mem_score=3; mem_desc="勉强(1G)"
     else mem_score=1; mem_desc="极小(<1G)"; fi
 fi
 echo -e "   内存: ${mem_total:-0}MB -> ${mem_score}/10 ($mem_desc)"
