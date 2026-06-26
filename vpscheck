@@ -63,8 +63,23 @@ else
         else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
         echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
     elif [[ -n "$fio_output" ]] && [[ $fio_exit_code -eq 0 ]]; then
-        # fio 正常执行，提取 IOPS
-        iops=$(echo "$fio_output" | grep -oP 'iops=\K[0-9]+' | head -1)
+        # fio 正常执行，提取 IOPS（多种兼容方式）
+        iops=""
+        # 方式1：匹配 "iops=数字"
+        iops=$(echo "$fio_output" | grep -o 'iops=[0-9]*' | head -1 | cut -d= -f2)
+        # 方式2：匹配 "IOPS=数字"
+        if [[ -z "$iops" ]]; then
+            iops=$(echo "$fio_output" | grep -o 'IOPS=[0-9]*' | head -1 | cut -d= -f2)
+        fi
+        # 方式3：匹配 "iops 数字"
+        if [[ -z "$iops" ]]; then
+            iops=$(echo "$fio_output" | grep -o 'iops [0-9]*' | head -1 | awk '{print $2}')
+        fi
+        # 方式4：匹配 "数字 iops"
+        if [[ -z "$iops" ]]; then
+            iops=$(echo "$fio_output" | grep -o '[0-9]* iops' | head -1 | awk '{print $1}')
+        fi
+
         if [[ -n "$iops" && "$iops" -gt 0 ]]; then
             # 成功提取 IOPS，按 4K 随机读评分
             if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
@@ -75,7 +90,7 @@ else
             else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
             echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
         else
-            # fio 执行了但没提取到 IOPS，降级到 dd
+            # 未能提取 IOPS，降级到 dd
             echo -e "   ${YELLOW}⚠️ 无法提取 IOPS，改用 dd 测速${NC}"
             dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
             rm -f /tmp/test
