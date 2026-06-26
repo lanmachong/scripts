@@ -27,7 +27,9 @@ if (( $(echo "$ratio >= 3.5" | bc -l) )); then mg=10; elif (( $(echo "$ratio >= 
 cpu_score=$(echo "scale=1; $sg * 0.6 + $mg * 0.4" | bc)
 echo -e "   单核: ${single_score}分 | 多核: ${multi_score}分 (${cores}核) -> ${cpu_score}/10"
 
-echo -e "\n${YELLOW}💾 [2/7] 磁盘性能检测...${NC}"
+echo -e "\n${YELLOW}💾 [2/7] 磁盘与内存性能检测...${NC}"
+
+# ==================== 磁盘检测 ====================
 disk_score=0
 iops="N/A"
 
@@ -53,7 +55,6 @@ else
     rm -f /tmp/4k_read* 2>/dev/null
 
     if [[ $fio_exit_code -eq 137 ]] || [[ $fio_exit_code -eq 139 ]]; then
-        # 被 OOM Killer 杀掉或段错误，降级到 dd
         echo -e "   ${YELLOW}⚠️ 4K测试被系统终止，改用 dd 测速${NC}"
         dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
         rm -f /tmp/test
@@ -63,25 +64,15 @@ else
         else disk_score=2; disk_desc="慢速(${dd_out}MB/s)"; fi
         echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
     elif [[ -n "$fio_output" ]] && [[ $fio_exit_code -eq 0 ]]; then
-        # fio 正常执行，提取 IOPS（多种兼容方式）
         iops=""
-        # 方式1：匹配 "iops=数字"
-        iops=$(echo "$fio_output" | grep -o 'iops=[0-9]*' | head -1 | cut -d= -f2)
-        # 方式2：匹配 "IOPS=数字"
+        iops=$(echo "$fio_output" | grep -oE 'iops=[0-9]+' | head -1 | cut -d= -f2)
         if [[ -z "$iops" ]]; then
-            iops=$(echo "$fio_output" | grep -o 'IOPS=[0-9]*' | head -1 | cut -d= -f2)
+            iops=$(echo "$fio_output" | grep -oE 'IOPS=[0-9]+' | head -1 | cut -d= -f2)
         fi
-        # 方式3：匹配 "iops 数字"
         if [[ -z "$iops" ]]; then
-            iops=$(echo "$fio_output" | grep -o 'iops [0-9]*' | head -1 | awk '{print $2}')
+            iops=$(echo "$fio_output" | grep -oE 'iops [0-9]+' | head -1 | awk '{print $2}')
         fi
-        # 方式4：匹配 "数字 iops"
-        if [[ -z "$iops" ]]; then
-            iops=$(echo "$fio_output" | grep -o '[0-9]* iops' | head -1 | awk '{print $1}')
-        fi
-
-        if [[ -n "$iops" && "$iops" -gt 0 ]]; then
-            # 成功提取 IOPS，按 4K 随机读评分
+        if [[ -n "$iops" && "$iops" -gt 100 ]]; then
             if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
             elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
             elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
@@ -90,8 +81,7 @@ else
             else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
             echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
         else
-            # 未能提取 IOPS，降级到 dd
-            echo -e "   ${YELLOW}⚠️ 无法提取 IOPS，改用 dd 测速${NC}"
+            echo -e "   ${YELLOW}⚠️ 无法获取有效 IOPS，改用 dd 测速${NC}"
             dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
             rm -f /tmp/test
             if [[ ${dd_out%.*} -ge 1000 ]]; then disk_score=9; disk_desc="极速(${dd_out}MB/s)"
@@ -101,7 +91,6 @@ else
             echo -e "   磁盘: ${disk_desc} -> ${disk_score}/10"
         fi
     else
-        # fio 完全失败，降级到 dd
         echo -e "   ${YELLOW}⚠️ fio 测试异常，改用 dd 测速${NC}"
         dd_out=$(dd if=/dev/zero of=/tmp/test bs=1M count=256 conv=fdatasync 2>&1 | tail -1 | awk -F'[ ,]' '{print $(NF-1)}')
         rm -f /tmp/test
@@ -113,7 +102,7 @@ else
     fi
 fi
 
-echo -e "\n${YELLOW}🧠 内存性能检测...${NC}"
+# ==================== 内存检测 ====================
 mem_total=$(free -m | awk '/Mem:/{print $2}')
 if [[ -z "$mem_total" || "$mem_total" == "0" ]]; then
     mem_score=1
