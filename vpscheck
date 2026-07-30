@@ -48,8 +48,8 @@ if ! command -v bc &> /dev/null; then
 fi
 
 echo -e "${BLUE}=========================================${NC}"
-echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.6        ${NC}"
-echo -e "${BLUE}   新增：带宽三次测速取最大值        ${NC}"
+echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.7        ${NC}"
+echo -e "${BLUE}   带宽测速改用 curl 多源下载       ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
@@ -451,62 +451,64 @@ baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.bai
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
 
-speed_score=3
-speed_desc="测速失败"
-upload_mbps=0
+# ==================== curl 多源下载测速 ====================
+echo -e "   ${YELLOW}正在测速（共3次，取最大值，每次约8秒）...${NC}"
 
-# 安装 speedtest-cli
-if ! command -v speedtest-cli &> /dev/null; then
-    echo -e "   ${YELLOW}正在安装 speedtest-cli（约10秒）...${NC}"
-    apt install speedtest-cli -y >/dev/null 2>&1 || yum install speedtest-cli -y >/dev/null 2>&1
-    if ! command -v speedtest-cli &> /dev/null; then
-        apt install python3-pip -y >/dev/null 2>&1
-        pip3 install speedtest-cli -q >/dev/null 2>&1
-    fi
-fi
+# 测速源列表（全球 CDN 节点）
+test_urls=(
+    "https://speed.cloudflare.com/__down?bytes=100000000"
+    "https://cachefly.cachefly.net/100mb.test"
+    "https://speedtest.sgp1.digitalocean.com/100mb.test"
+    "https://speedtest.tokyo.linode.com/100MB-fakefile"
+    "https://speedtest.singapore.linode.com/100MB-fakefile"
+    "https://speedtest.fra1.digitalocean.com/100mb.test"
+    "https://speedtest.ams3.digitalocean.com/100mb.test"
+    "https://speedtest.lon1.digitalocean.com/100mb.test"
+    "https://speedtest.nyc3.digitalocean.com/100mb.test"
+    "https://speedtest.sjc2.digitalocean.com/100mb.test"
+    "https://speedtest.ewr.linode.com/100MB-fakefile"
+)
 
-# 三次测速取最大值（每次显示结果）
-if command -v speedtest-cli &> /dev/null; then
-    echo -e "   ${YELLOW}正在测速（共3次，取最大值）...${NC}"
-    max_upload=0
-    
-    for i in {1..3}; do
-        st_result=$(timeout 15 speedtest-cli --simple 2>/dev/null)
-        if [[ -n "$st_result" ]]; then
-            upload_raw=$(echo "$st_result" | grep -i "Upload" | awk '{print $2}')
-            if [[ -n "$upload_raw" && "$upload_raw" != "0" ]]; then
-                upload_mbps_tmp=$(printf "%.1f" "$upload_raw")
-                if (( $(echo "$upload_mbps_tmp > $max_upload" | bc -l 2>/dev/null) )); then
-                    max_upload=$upload_mbps_tmp
-                fi
-                echo -e "   第 ${i}/3 次: ${upload_mbps_tmp} Mbps"
-            else
-                echo -e "   第 ${i}/3 次: 失败"
+max_speed=0
+success_count=0
+
+for i in {1..3}; do
+    echo -e "   第 ${i}/3 次测速中..."
+    current_max=0
+    for url in "${test_urls[@]}"; do
+        speed=$(timeout 8 curl -o /dev/null -s -w '%{speed_download}' "$url" 2>/dev/null)
+        if [[ -n "$speed" && "$speed" != "0" ]]; then
+            mbps=$(echo "scale=2; $speed * 8 / 1000000" | bc 2>/dev/null)
+            if [[ -n "$mbps" ]] && (( $(echo "$mbps > $current_max" | bc -l 2>/dev/null) )); then
+                current_max=$mbps
             fi
-        else
-            echo -e "   第 ${i}/3 次: 失败"
         fi
-        # 每次间隔1秒
-        sleep 1
     done
     
-    # 显示最终结果
-    if [[ -n "$max_upload" && "$max_upload" != "0" ]]; then
-        upload_mbps=$max_upload
-        speed_desc="出站(${upload_mbps}Mbps)"
-        echo -e "   ${GREEN}✅ 三次测速取最大值: ${upload_mbps} Mbps${NC}"
+    if [[ -n "$current_max" && "$current_max" != "0" ]]; then
+        echo -e "   第 ${i}/3 次: ${current_max} Mbps"
+        success_count=$((success_count + 1))
+        if (( $(echo "$current_max > $max_speed" | bc -l 2>/dev/null) )); then
+            max_speed=$current_max
+        fi
     else
-        echo -e "   ${YELLOW}⚠️ 所有测速均失败，建议手动测试${NC}"
-        speed_desc="测速全部失败"
-        upload_mbps=0
+        echo -e "   第 ${i}/3 次: 失败"
     fi
+    sleep 1
+done
+
+# 显示最终结果
+if [[ -n "$max_speed" && "$max_speed" != "0" ]]; then
+    upload_mbps=$max_speed
+    speed_desc="入站(最大 ${upload_mbps}Mbps)"
+    echo -e "   ${GREEN}✅ 有效测速 ${success_count}/3 次，取最大值: ${upload_mbps} Mbps${NC}"
 else
-    echo -e "   ${YELLOW}⚠️ speedtest-cli 安装失败，跳过测速${NC}"
-    speed_desc="测速失败"
+    echo -e "   ${YELLOW}⚠️ 所有测速均失败，带宽得分给基础分${NC}"
     upload_mbps=0
+    speed_desc="测速全部失败"
 fi
 
-# 带宽评分（通用阈值，高分对应高带宽）
+# 带宽评分
 if [[ -n "$upload_mbps" && "$upload_mbps" != "0" ]]; then
     if (( $(echo "$upload_mbps >= 80" | bc -l) )); then speed_score=10
     elif (( $(echo "$upload_mbps >= 50" | bc -l) )); then speed_score=9
@@ -652,7 +654,7 @@ total=$(awk "BEGIN {printf \"%.2f\", \
 final=$(printf "%.1f" "$total")
 
 echo -e "\n${BLUE}=========================================${NC}"
-echo -e "${BLUE}         🏆 最终体检报告 (v5.6)       ${NC}"
+echo -e "${BLUE}         🏆 最终体检报告 (v5.7)       ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 echo -e "硬件性能 (35%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
 echo -e "  └─ CPU: $cpu_score/10  [$GREEN$(show_score_standard $cpu_score cpu)${NC}]"
