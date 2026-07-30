@@ -1,13 +1,55 @@
 #!/bin/bash
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0m'
 
+# ==================== 评分标准显示函数 ====================
+show_score_standard() {
+    local score=$1
+    local type=$2
+    if [[ "$type" == "cpu" ]]; then
+        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "极强"
+        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "良好"
+        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "一般"
+        else echo "较弱"; fi
+    elif [[ "$type" == "disk" ]]; then
+        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "极速NVMe"
+        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "高速NVMe"
+        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "普通SSD"
+        else echo "慢速盘"; fi
+    elif [[ "$type" == "memory" ]]; then
+        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "充裕"
+        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "够用"
+        elif (( $(echo "$score >= 4" | bc -l 2>/dev/null) )); then echo "勉强"
+        else echo "不足"; fi
+    elif [[ "$type" == "network" ]]; then
+        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "优秀"
+        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "良好"
+        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "一般"
+        else echo "较差"; fi
+    elif [[ "$type" == "ip" ]]; then
+        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "优质IP"
+        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "良好IP"
+        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "普通IP"
+        else echo "较差IP"; fi
+    elif [[ "$type" == "route" ]]; then
+        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "直连精品"
+        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "直连普通"
+        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "混合线路"
+        else echo "绕路"; fi
+    elif [[ "$type" == "stream" ]]; then
+        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "全解锁"
+        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "大部分解锁"
+        elif (( $(echo "$score >= 4" | bc -l 2>/dev/null) )); then echo "部分解锁"
+        else echo "基本不解锁"; fi
+    fi
+}
+
 if ! command -v bc &> /dev/null; then
     apt install bc -y >/dev/null 2>&1 || yum install bc -y >/dev/null 2>&1
 fi
 
 echo -e "${BLUE}=========================================${NC}"
-echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.3        ${NC}"
-echo -e "${BLUE}   修复：回程检测优化/带宽权重调整  ${NC}"
+echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.4        ${NC}"
+echo -e "${BLUE}   修复：IP检测/回程优化/评分标准    ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
@@ -101,39 +143,40 @@ if [[ -n "$geo" ]]; then
     echo -e "   位置: $country - $city | 运营商: $isp"
     echo -e "   ASN信息: $as_info"
     
+    # ---- 参考 ping0.cc 标准判断原生IP ----
+    # 原理：WHOIS注册国家 == GeoIP定位国家 → 原生IP
     ip_type="未知"
     ip_bonus=0
-    as_org=$(echo "$as_info" | sed 's/^AS[0-9]* //')
+    reg_country=""
     
-    if echo "$as_org" | grep -qiE "HK|Hong Kong|Japan|Singapore|Korea|Taiwan|China|CN"; then
-        if [[ "$country_code" == "HK" || "$country_code" == "JP" || "$country_code" == "SG" || "$country_code" == "KR" || "$country_code" == "TW" || "$country_code" == "CN" ]]; then
-            ip_type="原生IP ✓ (ASN注册地与位置一致)"
-            ip_bonus=2
-        else
-            ip_type="广播IP (ASN亚洲但位置在非亚洲)"
-            ip_bonus=0
-        fi
-    elif echo "$as_org" | grep -qiE "INC|LLC|Corp|US|United States|America"; then
-        if [[ "$country_code" == "US" ]]; then
-            ip_type="原生IP ✓ (ASN美国且位置在美国)"
-            ip_bonus=2
-        else
-            ip_type="广播IP (ASN注册在美国，但IP在当前地区)"
-            ip_bonus=0
-        fi
+    # 方式1：从 ipinfo.io 获取注册国（最准确）
+    reg_country=$(curl -s --max-time 3 https://ipinfo.io/country 2>/dev/null)
+    if [[ -n "$reg_country" && "$reg_country" == "$country_code" ]]; then
+        ip_type="原生IP ✓ (注册国=$reg_country，定位国=$country_code)"
+        ip_bonus=2
+    elif [[ -n "$reg_country" && "$reg_country" != "$country_code" ]]; then
+        ip_type="广播IP (注册国=$reg_country，定位国=$country_code)"
+        ip_bonus=0
     else
-        reg=$(curl -s --max-time 3 https://ipinfo.io/country 2>/dev/null)
-        if [[ -n "$reg" && "$reg" == "$country_code" ]]; then
-            ip_type="可能原生 (位置与注册国一致)"
-            ip_bonus=1
+        # 备选：从 as_info 中猜测
+        as_org=$(echo "$as_info" | sed 's/^AS[0-9]* //')
+        if echo "$as_org" | grep -qiE "HK|Hong Kong|Japan|Singapore|Korea|Taiwan|China|CN"; then
+            if [[ "$country_code" == "HK" || "$country_code" == "JP" || "$country_code" == "SG" || "$country_code" == "KR" || "$country_code" == "TW" || "$country_code" == "CN" ]]; then
+                ip_type="原生IP ✓ (ASN注册地与位置一致)"
+                ip_bonus=2
+            else
+                ip_type="广播IP (ASN亚洲但位置在非亚洲)"
+                ip_bonus=0
+            fi
         else
-            ip_type="可能广播 (位置与注册国不一致)"
+            ip_type="未知 (无法确定注册国)"
             ip_bonus=0
         fi
     fi
     
     echo -e "   IP类型: $ip_type ($([ $ip_bonus -gt 0 ] && echo "+${ip_bonus}分" || echo "不加分"))"
     
+    # 设置 region
     if [[ "$country" == "Hong Kong" || "$country" == "Japan" || "$country" == "Singapore" || "$country" == "South Korea" || "$country" == "Taiwan" ]]; then
         base_ip=9
         region="亚洲"
@@ -303,13 +346,23 @@ declare -A nodes=(
 )
 
 cn2gia_count=0; cn2gt_count=0; telecom_163=0; unicom_4837=0; mobile_cmi=0; detect_success=0; route_summary=()
-echo -e "   ${YELLOW}正在检测多节点回程路由...${NC}"
+echo -e "   ${YELLOW}正在检测多节点回程路由（尝试多种模式）...${NC}"
 for node_name in "${!nodes[@]}"; do
     target_ip="${nodes[$node_name]}"
-    # 先尝试 TCP 模式，失败则尝试 ICMP 模式
+    route_output=""
+    # 模式1：TCP 模式（端口80）
     route_output=$(timeout 8 traceroute -T -p 80 -m 15 "$target_ip" 2>/dev/null)
+    # 模式2：如果 TCP 失败，尝试 ICMP 模式
     if [[ -z "$route_output" ]]; then
         route_output=$(timeout 8 traceroute -I -m 15 "$target_ip" 2>/dev/null)
+    fi
+    # 模式3：如果 ICMP 也失败，尝试 UDP 模式（使用非特权端口）
+    if [[ -z "$route_output" ]]; then
+        route_output=$(timeout 8 traceroute -U -p 33434 -m 15 "$target_ip" 2>/dev/null)
+    fi
+    # 模式4：如果都失败，尝试用 mtr 检测（如果有）
+    if [[ -z "$route_output" ]] && command -v mtr &> /dev/null; then
+        route_output=$(timeout 8 mtr -r -c 3 -m 15 "$target_ip" 2>/dev/null)
     fi
     if [[ -n "$route_output" ]]; then
         detect_success=$((detect_success + 1))
@@ -326,8 +379,10 @@ for node_name in "${!nodes[@]}"; do
         elif echo "$route_output" | grep -qiE "202\.97|163"; then
             telecom_163=$((telecom_163 + 1)); route_summary+=("${node_name}: 电信163")
         else
-            route_summary+=("${node_name}: 未知线路")
+            route_summary+=("${node_name}: 普通线路")
         fi
+    else
+        route_summary+=("${node_name}: 检测超时")
     fi
 done
 
@@ -339,6 +394,7 @@ if [[ ${#route_summary[@]} -gt 6 ]]; then
     echo -e "     ... 共 ${#route_summary[@]} 个节点"
 fi
 
+# 评分逻辑
 if [[ $detect_success -eq 0 ]]; then
     route_score=5; route_desc="所有节点检测失败"
 elif [[ $cn2gia_count -gt 0 ]]; then
@@ -416,7 +472,7 @@ else
     speed_desc="出站(${upload_mbps}Mbps)"
 fi
 
-# 带宽评分（阈值调低，更合理）
+# 带宽评分（阈值合理）
 if [[ -n "$upload_mbps" && "$upload_mbps" != "0" && "$upload_mbps" != "0.0" ]]; then
     if (( $(echo "$upload_mbps >= 50" | bc -l) )); then speed_score=10
     elif (( $(echo "$upload_mbps >= 30" | bc -l) )); then speed_score=9
@@ -562,13 +618,21 @@ total=$(awk "BEGIN {printf \"%.2f\", \
 final=$(printf "%.1f" "$total")
 
 echo -e "\n${BLUE}=========================================${NC}"
-echo -e "${BLUE}         🏆 最终体检报告 (v5.3)       ${NC}"
+echo -e "${BLUE}         🏆 最终体检报告 (v5.4)       ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 echo -e "硬件性能 (35%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
+echo -e "  └─ CPU: $cpu_score/10  [$GREEN$(show_score_standard $cpu_score cpu)${NC}]"
+echo -e "  └─ 磁盘: $disk_score/10  [$GREEN$(show_score_standard $disk_score disk)${NC}]"
+echo -e "  └─ 内存: $mem_score/10  [$GREEN$(show_score_standard $mem_score memory)${NC}]"
 echo -e "网络质量 (30%) : ${score_net}/10  (延迟:${lat_int}ms | 带宽:$speed_desc)"
+echo -e "  └─ 延迟: ${lat_score}/10  [$GREEN$(show_score_standard $lat_score network)${NC}]"
+echo -e "  └─ 带宽: ${speed_score}/10  [$GREEN$(show_score_standard $speed_score network)${NC}]"
 echo -e "IP体质   (12%) : ${score_ip}/10  (${region} | ${ip_type})"
+echo -e "  └─ $GREEN$(show_score_standard $score_ip ip)${NC}"
 echo -e "流媒体   (8%)  : ${score_stream}/10"
+echo -e "  └─ $GREEN$(show_score_standard $score_stream stream)${NC}"
 echo -e "回程直连 (15%) : ${route_score}/10"
+echo -e "  └─ $GREEN$(show_score_standard $route_score route)${NC}"
 echo -e "TikTok   (附加) : +${tiktok_bonus}分 (${tiktok_region:-无})"
 echo -e "-----------------------------------------"
 
