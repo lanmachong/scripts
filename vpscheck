@@ -43,13 +43,174 @@ show_score_standard() {
     fi
 }
 
+# ==================== 综合评语生成函数 ====================
+generate_comment() {
+    local cpu=$1
+    local disk=$2
+    local mem=$3
+    local net=$4
+    local ip=$5
+    local route=$6
+    local stream=$7
+    local final=$8
+    local region=$9
+    local ip_type=${10}
+    
+    local comment=""
+    
+    # ---- CPU 评价 ----
+    if (( $(echo "$cpu >= 9" | bc -l 2>/dev/null) )); then
+        cpu_comment="CPU性能极强"
+    elif (( $(echo "$cpu >= 7" | bc -l 2>/dev/null) )); then
+        cpu_comment="CPU性能良好"
+    elif (( $(echo "$cpu >= 5" | bc -l 2>/dev/null) )); then
+        cpu_comment="CPU性能一般"
+    else
+        cpu_comment="CPU性能较弱"
+    fi
+    
+    # ---- 内存评价 ----
+    if (( $(echo "$mem >= 9" | bc -l 2>/dev/null) )); then
+        mem_comment="内存充裕"
+    elif (( $(echo "$mem >= 7" | bc -l 2>/dev/null) )); then
+        mem_comment="内存够用"
+    elif (( $(echo "$mem >= 4" | bc -l 2>/dev/null) )); then
+        mem_comment="内存偏小"
+    else
+        mem_comment="内存严重不足"
+    fi
+    
+    # ---- 磁盘评价 ----
+    if (( $(echo "$disk >= 9" | bc -l 2>/dev/null) )); then
+        disk_comment="磁盘极速"
+    elif (( $(echo "$disk >= 7" | bc -l 2>/dev/null) )); then
+        disk_comment="磁盘高速"
+    elif (( $(echo "$disk >= 5" | bc -l 2>/dev/null) )); then
+        disk_comment="磁盘普通"
+    else
+        disk_comment="磁盘较慢"
+    fi
+    
+    # ---- 网络评价 ----
+    if (( $(echo "$net >= 9" | bc -l 2>/dev/null) )); then
+        net_comment="网络质量优秀"
+    elif (( $(echo "$net >= 7" | bc -l 2>/dev/null) )); then
+        net_comment="网络质量良好"
+    elif (( $(echo "$net >= 5" | bc -l 2>/dev/null) )); then
+        net_comment="网络质量一般"
+    else
+        net_comment="网络质量较差"
+    fi
+    
+    # ---- 回程评价 ----
+    if (( $(echo "$route >= 9" | bc -l 2>/dev/null) )); then
+        route_comment="回程线路优质"
+    elif (( $(echo "$route >= 7" | bc -l 2>/dev/null) )); then
+        route_comment="回程线路尚可"
+    else
+        route_comment="回程线路普通"
+    fi
+    
+    # ---- IP 评价 ----
+    if echo "$ip_type" | grep -q "原生IP"; then
+        ip_comment="原生IP，风控低"
+    elif echo "$ip_type" | grep -q "广播IP"; then
+        ip_comment="广播IP，部分场景受限"
+    else
+        ip_comment="IP类型普通"
+    fi
+    
+    # ---- 流媒体评价 ----
+    if (( $(echo "$stream >= 9" | bc -l 2>/dev/null) )); then
+        stream_comment="流媒体全解锁"
+    elif (( $(echo "$stream >= 7" | bc -l 2>/dev/null) )); then
+        stream_comment="流媒体大部分解锁"
+    elif (( $(echo "$stream >= 4" | bc -l 2>/dev/null) )); then
+        stream_comment="流媒体部分解锁"
+    else
+        stream_comment="流媒体解锁能力弱"
+    fi
+    
+    # ---- 硬件概况 ----
+    hw_avg=$(awk "BEGIN {printf \"%.1f\", ($cpu + $disk + $mem) / 3}")
+    if (( $(echo "$hw_avg >= 7" | bc -l 2>/dev/null) )); then
+        hw_summary="硬件配置较好"
+    elif (( $(echo "$hw_avg >= 5" | bc -l 2>/dev/null) )); then
+        hw_summary="硬件配置中等"
+    else
+        hw_summary="硬件配置偏低"
+    fi
+    
+    # ---- 综合优势与劣势 ----
+    advantages=()
+    disadvantages=()
+    
+    # 优势
+    (( $(echo "$cpu >= 7" | bc -l 2>/dev/null) )) && advantages+=("CPU性能较强")
+    (( $(echo "$mem >= 7" | bc -l 2>/dev/null) )) && advantages+=("内存充足")
+    (( $(echo "$disk >= 7" | bc -l 2>/dev/null) )) && advantages+=("磁盘读写快")
+    (( $(echo "$net >= 8" | bc -l 2>/dev/null) )) && advantages+=("网络质量好")
+    (( $(echo "$route >= 8" | bc -l 2>/dev/null) )) && advantages+=("回程线路优质")
+    echo "$ip_type" | grep -q "原生IP" && advantages+=("原生IP")
+    (( $(echo "$stream >= 7" | bc -l 2>/dev/null) )) && advantages+=("流媒体解锁能力强")
+    
+    # 劣势
+    (( $(echo "$cpu < 5" | bc -l 2>/dev/null) )) && disadvantages+=("CPU性能较弱")
+    (( $(echo "$mem < 5" | bc -l 2>/dev/null) )) && disadvantages+=("内存较小")
+    (( $(echo "$disk < 5" | bc -l 2>/dev/null) )) && disadvantages+=("磁盘较慢")
+    (( $(echo "$net < 5" | bc -l 2>/dev/null) )) && disadvantages+=("网络质量一般")
+    (( $(echo "$route < 6" | bc -l 2>/dev/null) )) && disadvantages+=("回程线路普通")
+    echo "$ip_type" | grep -q "广播IP" && disadvantages+=("广播IP")
+    (( $(echo "$stream < 4" | bc -l 2>/dev/null) )) && disadvantages+=("流媒体解锁能力弱")
+    
+    # ---- 构建评价文本 ----
+    comment="【综合评价】$hw_summary，$net_comment。"
+    
+    # 添加优势
+    if [[ ${#advantages[@]} -gt 0 ]]; then
+        comment+="优势：$(IFS=、; echo "${advantages[*]}")"
+    fi
+    
+    # 添加劣势
+    if [[ ${#disadvantages[@]} -gt 0 ]]; then
+        comment+="；不足：$(IFS=、; echo "${disadvantages[*]}")"
+    fi
+    
+    # ---- 推荐用途 ----
+    if (( $(echo "$final >= 8.5" | bc -l 2>/dev/null) )); then
+        advice="全能型服务器，适合建站、代理、爬虫、流媒体解锁等多种场景，体验优秀。"
+    elif (( $(echo "$final >= 7.0" | bc -l 2>/dev/null) )); then
+        # 根据具体特点细分
+        if (( $(echo "$net >= 8" | bc -l 2>/dev/null) )) && echo "$ip_type" | grep -q "原生IP"; then
+            advice="适合代理、流媒体解锁或跨境业务，网络和IP质量都不错。"
+        elif (( $(echo "$cpu >= 8" | bc -l 2>/dev/null) )); then
+            advice="CPU性能突出，适合跑脚本、爬虫或轻量级计算任务。"
+        elif (( $(echo "$mem >= 8" | bc -l 2>/dev/null) )); then
+            advice="内存充足，适合建站、数据库或容器化部署。"
+        elif (( $(echo "$route >= 8" | bc -l 2>/dev/null) )); then
+            advice="回程线路好，适合对国内用户访问质量要求高的场景。"
+        elif (( $(echo "$stream >= 7" | bc -l 2>/dev/null) )); then
+            advice="流媒体解锁能力强，适合作为流媒体解锁专用机。"
+        else
+            advice="综合性能均衡，适合日常使用。"
+        fi
+    elif (( $(echo "$final >= 5.5" | bc -l 2>/dev/null) )); then
+        advice="存在明显短板，建议根据具体需求判断。如做代理请关注网络质量，建站请关注硬件配置。"
+    else
+        advice="性能较差，建议仅做备份、测试或轻量级用途。"
+    fi
+    
+    echo -e "$comment"
+    echo -e "【建议】$advice"
+}
+
 if ! command -v bc &> /dev/null; then
     apt install bc -y >/dev/null 2>&1 || yum install bc -y >/dev/null 2>&1
 fi
 
 echo -e "${BLUE}=========================================${NC}"
-echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.10       ${NC}"
-echo -e "${BLUE}   带宽测速：speedtest-cli三次取最大  ${NC}"
+echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.11       ${NC}"
+echo -e "${BLUE}   新增：综合评语 & 使用建议        ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
@@ -656,7 +817,7 @@ total=$(awk "BEGIN {printf \"%.2f\", \
 final=$(printf "%.1f" "$total")
 
 echo -e "\n${BLUE}=========================================${NC}"
-echo -e "${BLUE}         🏆 最终体检报告 (v5.10)      ${NC}"
+echo -e "${BLUE}         🏆 最终体检报告 (v5.11)      ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 echo -e "硬件性能 (35%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
 echo -e "  └─ CPU: $cpu_score/10  [$GREEN$(show_score_standard $cpu_score cpu)${NC}]"
@@ -676,15 +837,16 @@ echo -e "-----------------------------------------"
 
 if (( $(echo "$final >= 8.5" | bc -l) )); then
     echo -e "${GREEN}【总分】: ${final} / 10.0  🏆 S级 (神机)${NC}"
-    echo -e "【标准】: ≥8.5分，各项表现优异，强烈推荐"
 elif (( $(echo "$final >= 7.0" | bc -l) )); then
     echo -e "${GREEN}【总分】: ${final} / 10.0  ✅ A级 (优秀)${NC}"
-    echo -e "【标准】: 7.0-8.4分，综合性能良好，值得入手"
 elif (( $(echo "$final >= 5.5" | bc -l) )); then
     echo -e "${YELLOW}【总分】: ${final} / 10.0  ⚠️ B级 (及格)${NC}"
-    echo -e "【标准】: 5.5-6.9分，存在明显短板，适合特定用途"
 else
     echo -e "${RED}【总分】: ${final} / 10.0  ❌ C/D级${NC}"
-    echo -e "【标准】: <5.5分，性能较差，建议换机"
 fi
+
+# 生成综合评语
+echo -e "\n${YELLOW}📋 综合评语${NC}"
+generate_comment "$cpu_score" "$disk_score" "$mem_score" "$score_net" "$score_ip" "$route_score" "$score_stream" "$final" "$region" "$ip_type"
+
 echo -e "${BLUE}=========================================${NC}"
