@@ -48,14 +48,22 @@ if ! command -v bc &> /dev/null; then
 fi
 
 echo -e "${BLUE}=========================================${NC}"
-echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.4        ${NC}"
-echo -e "${BLUE}   修复：IP检测/回程优化/评分标准    ${NC}"
+echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.5        ${NC}"
+echo -e "${BLUE}   新增：显示CPU型号/磁盘设备        ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
 if ! command -v sysbench &> /dev/null; then
     apt install sysbench -y >/dev/null 2>&1 || yum install sysbench -y >/dev/null 2>&1
 fi
+
+# 获取 CPU 型号
+cpu_model=$(lscpu | grep "Model name" | head -1 | awk -F':' '{print $2}' | xargs)
+if [[ -z "$cpu_model" ]]; then
+    cpu_model=$(cat /proc/cpuinfo | grep "model name" | head -1 | awk -F':' '{print $2}' | xargs)
+fi
+echo -e "   CPU型号: ${cpu_model:-未知}"
+
 sysbench cpu --threads=1 --time=5 run > /tmp/cpu_single.log 2>&1
 single_score=$(grep "events per second:" /tmp/cpu_single.log | awk '{print $4}' | cut -d. -f1)
 cores=$(nproc)
@@ -71,7 +79,27 @@ echo -e "   单核: ${single_score}分 | 多核: ${multi_score}分 (${cores}核)
 
 echo -e "\n${YELLOW}💾 [2/7] 磁盘与内存性能检测...${NC}"
 
-# ==================== 磁盘检测 ====================
+# ==================== 磁盘设备信息 ====================
+root_dev=$(df -h / | tail -1 | awk '{print $1}')
+if [[ -n "$root_dev" ]]; then
+    dev_name=$(basename "$root_dev")
+    if [[ "$dev_name" == vd* ]]; then
+        dev_type="virtio"
+    elif [[ "$dev_name" == nvme* ]]; then
+        dev_type="nvme"
+    elif [[ "$dev_name" == sd* ]]; then
+        dev_type="sata/scsi"
+    elif [[ "$dev_name" == xvd* ]]; then
+        dev_type="xen"
+    else
+        dev_type="unknown"
+    fi
+    echo -e "   磁盘设备: $root_dev ($dev_type)"
+else
+    echo -e "   磁盘设备: 无法获取"
+fi
+
+# ==================== 磁盘性能测试 ====================
 disk_score=0
 iops="N/A"
 
@@ -618,7 +646,7 @@ total=$(awk "BEGIN {printf \"%.2f\", \
 final=$(printf "%.1f" "$total")
 
 echo -e "\n${BLUE}=========================================${NC}"
-echo -e "${BLUE}         🏆 最终体检报告 (v5.4)       ${NC}"
+echo -e "${BLUE}         🏆 最终体检报告 (v5.5)       ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 echo -e "硬件性能 (35%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
 echo -e "  └─ CPU: $cpu_score/10  [$GREEN$(show_score_standard $cpu_score cpu)${NC}]"
