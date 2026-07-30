@@ -6,8 +6,8 @@ if ! command -v bc &> /dev/null; then
 fi
 
 echo -e "${BLUE}=========================================${NC}"
-echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.2        ${NC}"
-echo -e "${BLUE}   新增：出站带宽测速（speedtest）  ${NC}"
+echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.3        ${NC}"
+echo -e "${BLUE}   修复：回程检测优化/带宽权重调整  ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
@@ -33,7 +33,6 @@ echo -e "\n${YELLOW}💾 [2/7] 磁盘与内存性能检测...${NC}"
 disk_score=0
 iops="N/A"
 
-# 直接尝试 fio 测试（不管内存大小，先试了再说）
 if ! command -v fio &> /dev/null; then
     apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
 fi
@@ -43,13 +42,11 @@ fio_output=$(timeout 10 fio --name=4k_read --directory=/tmp --size=128M --bs=4k 
 fio_exit_code=$?
 rm -f /tmp/4k_read* 2>/dev/null
 
-# fio 执行失败或被终止
 if [[ $fio_exit_code -ne 0 ]] || [[ -z "$fio_output" ]]; then
     echo -e "   ${YELLOW}⚠️ fio 测试失败，磁盘得分 1 分${NC}"
     disk_score=1
     echo -e "   磁盘: 测试失败 -> ${disk_score}/10"
 else
-    # 从 "read: IOPS=126k" 提取 IOPS（处理 k 单位）
     iops_raw=$(echo "$fio_output" | grep -oE 'read:.*IOPS=[0-9.]+[kK]?' | head -1 | grep -oE '[0-9.]+[kK]?' | head -1)
     if [[ -n "$iops_raw" ]]; then
         if [[ "$iops_raw" =~ [kK]$ ]]; then
@@ -59,12 +56,10 @@ else
             iops=$(printf "%.0f" "$iops_raw")
         fi
     fi
-    # 备选：从汇总行 "iops : avg=xxx" 提取
     if [[ -z "$iops" || "$iops" == "0" ]]; then
         iops=$(echo "$fio_output" | grep -oE 'iops[[:space:]]*:[[:space:]]*.*avg=[0-9.]+' | grep -oE 'avg=[0-9.]+' | head -1 | cut -d= -f2 | cut -d. -f1)
     fi
 
-    # IOPS 有效且大于 500，正常评分
     if [[ -n "$iops" && "$iops" -gt 500 ]]; then
         if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
         elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
@@ -74,7 +69,6 @@ else
         else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
         echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
     else
-        # IOPS 无效，给 1 分
         echo -e "   ${YELLOW}⚠️ 无法获取有效 IOPS，磁盘得分 1 分${NC}"
         disk_score=1
         echo -e "   磁盘: 无有效数据 -> ${disk_score}/10"
@@ -140,7 +134,6 @@ if [[ -n "$geo" ]]; then
     
     echo -e "   IP类型: $ip_type ($([ $ip_bonus -gt 0 ] && echo "+${ip_bonus}分" || echo "不加分"))"
     
-    # 设置 region（确保赋值）
     if [[ "$country" == "Hong Kong" || "$country" == "Japan" || "$country" == "Singapore" || "$country" == "South Korea" || "$country" == "Taiwan" ]]; then
         base_ip=9
         region="亚洲"
@@ -157,7 +150,7 @@ if [[ -n "$geo" ]]; then
         region="欧洲"
     elif [[ "$country" == "Malaysia" || "$country" == "Vietnam" || "$country" == "Thailand" || "$country" == "Indonesia" || "$country" == "Philippines" ]]; then
         base_ip=6
-        region="亚洲"  # 东南亚也归为亚洲
+        region="亚洲"
     else
         base_ip=5
         region="其他"
@@ -167,7 +160,6 @@ if [[ -n "$geo" ]]; then
     [[ $score_ip -gt 10 ]] && score_ip=10
     echo -e "   体质: ${score_ip}/10 ($region) [基础分:$base_ip + 类型加分:$ip_bonus]"
 else
-    # geo 获取失败，设置默认值
     country="未知"
     city="未知"
     isp="未知"
@@ -262,12 +254,10 @@ else
     tiktok_score=0
     tiktok_region="无"
     if [[ "$tiktok_code" == "200" ]]; then
-        # 提取 region（多种模式）
         tiktok_region=$(echo "$tiktok_response" | grep -oE '"region":"[A-Z]{2,5}"' | head -1 | cut -d'"' -f4)
         if [[ -z "$tiktok_region" || "$tiktok_region" == "null" ]]; then
             tiktok_region=$(echo "$tiktok_response" | grep -oP '(?<=region":")[A-Z]{2,5}' | head -1)
         fi
-        # 过滤无效区域（如 ALISG、AWS 等云服务商标识）
         if [[ -n "$tiktok_region" ]]; then
             case "$tiktok_region" in
                 ALISG|AWS|AZURE|GCP|CLOUDFLARE|UNKNOWN)
@@ -304,7 +294,7 @@ fi
 declare -A nodes=(
     ["北京电信"]="219.141.140.10"
     ["上海电信"]="202.96.209.133"
-    ["广州电信"]="58.60.188.222"
+    ["广州电信"]="61.144.56.100"
     ["成都电信"]="61.139.2.69"
     ["北京联通"]="202.106.195.68"
     ["上海联通"]="210.22.97.1"
@@ -316,7 +306,11 @@ cn2gia_count=0; cn2gt_count=0; telecom_163=0; unicom_4837=0; mobile_cmi=0; detec
 echo -e "   ${YELLOW}正在检测多节点回程路由...${NC}"
 for node_name in "${!nodes[@]}"; do
     target_ip="${nodes[$node_name]}"
-    route_output=$(timeout 6 traceroute -T -p 80 -m 15 "$target_ip" 2>/dev/null)
+    # 先尝试 TCP 模式，失败则尝试 ICMP 模式
+    route_output=$(timeout 8 traceroute -T -p 80 -m 15 "$target_ip" 2>/dev/null)
+    if [[ -z "$route_output" ]]; then
+        route_output=$(timeout 8 traceroute -I -m 15 "$target_ip" 2>/dev/null)
+    fi
     if [[ -n "$route_output" ]]; then
         detect_success=$((detect_success + 1))
         if echo "$route_output" | grep -qiE "59\.43|CTGNET|CN2"; then
@@ -421,20 +415,24 @@ if [[ -z "$upload_mbps" || "$upload_mbps" == "0" || "$upload_mbps" == "0.0" ]]; 
 else
     speed_desc="出站(${upload_mbps}Mbps)"
 fi
+
+# 带宽评分（阈值调低，更合理）
 if [[ -n "$upload_mbps" && "$upload_mbps" != "0" && "$upload_mbps" != "0.0" ]]; then
-    if (( $(echo "$upload_mbps >= 80" | bc -l) )); then speed_score=10
-    elif (( $(echo "$upload_mbps >= 50" | bc -l) )); then speed_score=9
-    elif (( $(echo "$upload_mbps >= 30" | bc -l) )); then speed_score=8
-    elif (( $(echo "$upload_mbps >= 15" | bc -l) )); then speed_score=7
-    elif (( $(echo "$upload_mbps >= 8" | bc -l) )); then speed_score=5
-    elif (( $(echo "$upload_mbps >= 3" | bc -l) )); then speed_score=4
+    if (( $(echo "$upload_mbps >= 50" | bc -l) )); then speed_score=10
+    elif (( $(echo "$upload_mbps >= 30" | bc -l) )); then speed_score=9
+    elif (( $(echo "$upload_mbps >= 15" | bc -l) )); then speed_score=8
+    elif (( $(echo "$upload_mbps >= 8" | bc -l) )); then speed_score=7
+    elif (( $(echo "$upload_mbps >= 4" | bc -l) )); then speed_score=5
+    elif (( $(echo "$upload_mbps >= 2" | bc -l) )); then speed_score=4
     else speed_score=3
     fi
 else
     speed_score=3
 fi
 echo -e "   带宽: $speed_desc -> ${speed_score}/10"
-score_net=$(echo "scale=1; $tcp_score * 0.3 + $lat_score * 0.4 + $speed_score * 0.3" | bc)
+
+# 网络质量权重：TCP连通30%，延迟35%，带宽35%
+score_net=$(echo "scale=1; $tcp_score * 0.30 + $lat_score * 0.35 + $speed_score * 0.35" | bc)
 
 echo -e "\n${YELLOW}📺 [7/7] 流媒体解锁...${NC}"
 BrowserUA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -564,7 +562,7 @@ total=$(awk "BEGIN {printf \"%.2f\", \
 final=$(printf "%.1f" "$total")
 
 echo -e "\n${BLUE}=========================================${NC}"
-echo -e "${BLUE}         🏆 最终体检报告 (v5.2)       ${NC}"
+echo -e "${BLUE}         🏆 最终体检报告 (v5.3)       ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 echo -e "硬件性能 (35%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
 echo -e "网络质量 (30%) : ${score_net}/10  (延迟:${lat_int}ms | 带宽:$speed_desc)"
@@ -576,11 +574,15 @@ echo -e "-----------------------------------------"
 
 if (( $(echo "$final >= 8.5" | bc -l) )); then
     echo -e "${GREEN}【总分】: ${final} / 10.0  🏆 S级 (神机)${NC}"
+    echo -e "【标准】: ≥8.5分，各项表现优异，强烈推荐"
 elif (( $(echo "$final >= 7.0" | bc -l) )); then
     echo -e "${GREEN}【总分】: ${final} / 10.0  ✅ A级 (优秀)${NC}"
+    echo -e "【标准】: 7.0-8.4分，综合性能良好，值得入手"
 elif (( $(echo "$final >= 5.5" | bc -l) )); then
     echo -e "${YELLOW}【总分】: ${final} / 10.0  ⚠️ B级 (及格)${NC}"
+    echo -e "【标准】: 5.5-6.9分，存在明显短板，适合特定用途"
 else
     echo -e "${RED}【总分】: ${final} / 10.0  ❌ C/D级${NC}"
+    echo -e "【标准】: <5.5分，性能较差，建议换机"
 fi
 echo -e "${BLUE}=========================================${NC}"
