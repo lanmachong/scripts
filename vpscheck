@@ -49,7 +49,7 @@ fi
 
 echo -e "${BLUE}=========================================${NC}"
 echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.8        ${NC}"
-echo -e "${BLUE}   测速源：国内镜像 + 国外CDN       ${NC}"
+echo -e "${BLUE}   带宽测速：优先出站（本地下载）    ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
 echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
@@ -450,67 +450,118 @@ baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.bai
 [[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
 echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
 
-# ==================== curl 多源下载测速（国内镜像 + 国外CDN） ====================
-echo -e "   ${YELLOW}正在测速（共3次，取最大值，每次约8秒）...${NC}"
+speed_score=3
+speed_desc="测速失败"
+upload_mbps=0
 
-# 测速源列表（国内镜像 + 国外 CDN）
-test_urls=(
-    # 国内镜像（优先，保证可达性）
-    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
-    "https://mirrors.ustc.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
-    "https://mirrors.aliyun.com/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
-    "https://mirrors.cloud.tencent.com/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
-    # 国外 CDN
-    "https://speed.cloudflare.com/__down?bytes=100000000"
-    "https://cachefly.cachefly.net/100mb.test"
-    "https://speedtest.sgp1.digitalocean.com/100mb.test"
-    "https://speedtest.tokyo.linode.com/100MB-fakefile"
-    "https://speedtest.singapore.linode.com/100MB-fakefile"
-    "https://speedtest.fra1.digitalocean.com/100mb.test"
-    "https://speedtest.ams3.digitalocean.com/100mb.test"
-    "https://speedtest.lon1.digitalocean.com/100mb.test"
-    "https://speedtest.nyc3.digitalocean.com/100mb.test"
-    "https://speedtest.sjc2.digitalocean.com/100mb.test"
-    "https://speedtest.ewr.linode.com/100MB-fakefile"
-)
+# ==================== 优先测试出站带宽（VPS上传 = 本地下载） ====================
 
-max_speed=0
-success_count=0
+# 尝试安装 speedtest-cli
+if ! command -v speedtest-cli &> /dev/null; then
+    echo -e "   ${YELLOW}正在安装 speedtest-cli（约10秒）...${NC}"
+    apt install speedtest-cli -y >/dev/null 2>&1 || yum install speedtest-cli -y >/dev/null 2>&1
+    if ! command -v speedtest-cli &> /dev/null; then
+        apt install python3-pip -y >/dev/null 2>&1
+        pip3 install speedtest-cli -q >/dev/null 2>&1
+    fi
+fi
 
-for i in {1..3}; do
-    echo -e "   第 ${i}/3 次测速中..."
-    current_max=0
-    for url in "${test_urls[@]}"; do
-        speed=$(timeout 8 curl -L -o /dev/null -s -w '%{speed_download}' "$url" 2>/dev/null)
-        if [[ -n "$speed" && "$speed" != "0" ]]; then
-            mbps=$(echo "scale=2; $speed * 8 / 1000000" | bc 2>/dev/null)
-            if [[ -n "$mbps" ]] && (( $(echo "$mbps > $current_max" | bc -l 2>/dev/null) )); then
-                current_max=$mbps
+# 使用 speedtest-cli 测出站带宽（三次取最大值）
+if command -v speedtest-cli &> /dev/null; then
+    echo -e "   ${YELLOW}正在测速（共3次，取最大值）...${NC}"
+    max_upload=0
+    success_count=0
+    
+    for i in {1..3}; do
+        st_result=$(timeout 20 speedtest-cli --simple 2>/dev/null)
+        if [[ -n "$st_result" ]]; then
+            upload_raw=$(echo "$st_result" | grep -i "Upload" | awk '{print $2}')
+            if [[ -n "$upload_raw" && "$upload_raw" != "0" ]]; then
+                upload_mbps_tmp=$(printf "%.1f" "$upload_raw")
+                success_count=$((success_count + 1))
+                if (( $(echo "$upload_mbps_tmp > $max_upload" | bc -l 2>/dev/null) )); then
+                    max_upload=$upload_mbps_tmp
+                fi
+                echo -e "   第 ${i}/3 次: ${upload_mbps_tmp} Mbps"
+            else
+                echo -e "   第 ${i}/3 次: 失败"
             fi
+        else
+            echo -e "   第 ${i}/3 次: 失败"
         fi
+        sleep 1
     done
     
-    if [[ -n "$current_max" && "$current_max" != "0" ]]; then
-        echo -e "   第 ${i}/3 次: ${current_max} Mbps"
-        success_count=$((success_count + 1))
-        if (( $(echo "$current_max > $max_speed" | bc -l 2>/dev/null) )); then
-            max_speed=$current_max
-        fi
+    if [[ -n "$max_upload" && "$max_upload" != "0" ]]; then
+        upload_mbps=$max_upload
+        speed_desc="下载速度(最大 ${upload_mbps}Mbps)"
+        echo -e "   ${GREEN}✅ 有效测速 ${success_count}/3 次，取最大值: ${upload_mbps} Mbps${NC}"
     else
-        echo -e "   第 ${i}/3 次: 失败"
+        echo -e "   ${YELLOW}⚠️ speedtest-cli 全部失败，改用入站测速作为参考${NC}"
+        upload_mbps=0
     fi
-    sleep 1
-done
+fi
 
-# 显示最终结果
-if [[ -n "$max_speed" && "$max_speed" != "0" ]]; then
-    upload_mbps=$max_speed
-    speed_desc="入站(最大 ${upload_mbps}Mbps)"
-    echo -e "   ${GREEN}✅ 有效测速 ${success_count}/3 次，取最大值: ${upload_mbps} Mbps${NC}"
-else
-    echo -e "   ${YELLOW}⚠️ 所有测速均失败，带宽得分给基础分${NC}"
-    upload_mbps=0
-    speed_desc="测速全部失败"
+# ==================== 备用方案：入站测速（如果出站失败） ====================
+if [[ -z "$upload_mbps" || "$upload_mbps" == "0" ]]; then
+    echo -e "   ${YELLOW}正在测入站速度（共3次，取最大值）...${NC}"
+    
+    test_urls=(
+        "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+        "https://mirrors.ustc.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+        "https://mirrors.aliyun.com/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+        "https://mirrors.cloud.tencent.com/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso.torrent"
+        "https://speed.cloudflare.com/__down?bytes=100000000"
+        "https://cachefly.cachefly.net/100mb.test"
+        "https://speedtest.sgp1.digitalocean.com/100mb.test"
+        "https://speedtest.tokyo.linode.com/100MB-fakefile"
+        "https://speedtest.singapore.linode.com/100MB-fakefile"
+        "https://speedtest.fra1.digitalocean.com/100mb.test"
+        "https://speedtest.ams3.digitalocean.com/100mb.test"
+        "https://speedtest.lon1.digitalocean.com/100mb.test"
+        "https://speedtest.nyc3.digitalocean.com/100mb.test"
+        "https://speedtest.sjc2.digitalocean.com/100mb.test"
+        "https://speedtest.ewr.linode.com/100MB-fakefile"
+    )
+    
+    max_speed=0
+    success_count=0
+    
+    for i in {1..3}; do
+        echo -e "   第 ${i}/3 次测速中..."
+        current_max=0
+        for url in "${test_urls[@]}"; do
+            speed=$(timeout 8 curl -L -o /dev/null -s -w '%{speed_download}' "$url" 2>/dev/null)
+            if [[ -n "$speed" && "$speed" != "0" ]]; then
+                mbps=$(echo "scale=2; $speed * 8 / 1000000" | bc 2>/dev/null)
+                if [[ -n "$mbps" ]] && (( $(echo "$mbps > $current_max" | bc -l 2>/dev/null) )); then
+                    current_max=$mbps
+                fi
+            fi
+        done
+        
+        if [[ -n "$current_max" && "$current_max" != "0" ]]; then
+            echo -e "   第 ${i}/3 次: ${current_max} Mbps"
+            success_count=$((success_count + 1))
+            if (( $(echo "$current_max > $max_speed" | bc -l 2>/dev/null) )); then
+                max_speed=$current_max
+            fi
+        else
+            echo -e "   第 ${i}/3 次: 失败"
+        fi
+        sleep 1
+    done
+    
+    if [[ -n "$max_speed" && "$max_speed" != "0" ]]; then
+        upload_mbps=$max_speed
+        speed_desc="上传速度参考(最大 ${upload_mbps}Mbps)"
+        echo -e "   ${YELLOW}⚠️ 提示：入站速度不能代表本地下载性能，仅供参考${NC}"
+        echo -e "   ${GREEN}✅ 入站测速 ${success_count}/3 次，取最大值: ${upload_mbps} Mbps${NC}"
+    else
+        echo -e "   ${YELLOW}⚠️ 所有测速均失败${NC}"
+        upload_mbps=0
+        speed_desc="测速全部失败"
+    fi
 fi
 
 # 带宽评分
@@ -568,14 +619,14 @@ fi
 echo -e "   ${YELLOW}检测 Bilibili...${NC}"
 bilibili_status=""
 randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
-result=$(curl --user-agent "${BrowserUA}" -fsSL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=82846771&qn=0&type=&otype=json&ep_id=307247&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
+result=$(curl --user-agent "${BrowserUA}" -fsL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=82846771&qn=0&type=&otype=json&ep_id=307247&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
 if [[ "$result" != "curl"* ]]; then
     code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
     if [ "$code" = "0" ]; then bilibili_status="大陆限定"; fi
 fi
 if [ -z "$bilibili_status" ]; then
     randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
-    result=$(curl --user-agent "${BrowserUA}" -fsSL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
+    result=$(curl --user-agent "${BrowserUA}" -fsL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
     if [[ "$result" != "curl"* ]]; then
         code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
         if [ "$code" = "0" ]; then bilibili_status="港澳台限定"; fi
@@ -583,7 +634,7 @@ if [ -z "$bilibili_status" ]; then
 fi
 if [ -z "$bilibili_status" ]; then
     randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
-    result=$(curl --user-agent "${BrowserUA}" -fsSL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=50762638&cid=100279344&qn=0&type=&otype=json&ep_id=268176&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
+    result=$(curl --user-agent "${BrowserUA}" -fsL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=50762638&cid=100279344&qn=0&type=&otype=json&ep_id=268176&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
     if [[ "$result" != "curl"* ]]; then
         code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
         if [ "$code" = "0" ]; then bilibili_status="台湾限定"; fi
