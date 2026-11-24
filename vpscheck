@@ -1,852 +1,475 @@
-#!/bin/bash
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0m'
+#!/usr/bin/env bash
+# vpscheck v6.0 — 场景化 VPS 评测
+#
+# 设计原则：
+#   1. 不把「硬件质量」和「用途适配」混成一个分数，按场景分别出分
+#   2. 测不到就标记 N/A 并重分配权重，绝不估算、绝不编造
+#   3. 关键指标取中位数/多次采样，不取最大值，不拿单次瞬时值定生死
+#   4. 只报告能测的东西；去程就是去程，不冒充回程；原生/广播只作信息不作加分
+#
+# 用法: bash vpscheck.sh [--quick] [--install-deps]
+#   --quick         跳过测速和路由探测，缩短到约 30 秒
+#   --install-deps  由脚本尝试安装缺失的依赖（默认只提示，不擅自安装）
 
-# ==================== 评分标准显示函数 ====================
-show_score_standard() {
-    local score=$1
-    local type=$2
-    if [[ "$type" == "cpu" ]]; then
-        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "极强"
-        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "良好"
-        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "一般"
-        else echo "较弱"; fi
-    elif [[ "$type" == "disk" ]]; then
-        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "极速NVMe"
-        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "高速NVMe"
-        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "普通SSD"
-        else echo "慢速盘"; fi
-    elif [[ "$type" == "memory" ]]; then
-        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "充裕"
-        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "够用"
-        elif (( $(echo "$score >= 4" | bc -l 2>/dev/null) )); then echo "勉强"
-        else echo "不足"; fi
-    elif [[ "$type" == "network" ]]; then
-        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "优秀"
-        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "良好"
-        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "一般"
-        else echo "较差"; fi
-    elif [[ "$type" == "ip" ]]; then
-        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "优质IP"
-        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "良好IP"
-        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "普通IP"
-        else echo "较差IP"; fi
-    elif [[ "$type" == "route" ]]; then
-        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "直连精品"
-        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "直连普通"
-        elif (( $(echo "$score >= 5" | bc -l 2>/dev/null) )); then echo "混合线路"
-        else echo "绕路"; fi
-    elif [[ "$type" == "stream" ]]; then
-        if (( $(echo "$score >= 9" | bc -l 2>/dev/null) )); then echo "全解锁"
-        elif (( $(echo "$score >= 7" | bc -l 2>/dev/null) )); then echo "大部分解锁"
-        elif (( $(echo "$score >= 4" | bc -l 2>/dev/null) )); then echo "部分解锁"
-        else echo "基本不解锁"; fi
+set -uo pipefail
+
+QUICK=0
+INSTALL=0
+for arg in "$@"; do
+  case "$arg" in
+    --quick) QUICK=1 ;;
+    --install-deps) INSTALL=1 ;;
+    -h|--help)
+      echo "用法: bash $0 [--quick] [--install-deps]"
+      exit 0 ;;
+    *) echo "未知参数: $arg"; exit 1 ;;
+  esac
+done
+
+if [[ -t 1 ]]; then
+  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[34m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  R=''; G=''; Y=''; B=''; D=''; N=''
+fi
+
+WORKDIR=$(mktemp -d /tmp/vpscheck.XXXXXX 2>/dev/null || echo /tmp/vpscheck.$$)
+trap 'rm -rf "$WORKDIR"' EXIT
+
+# ---------------------------------------------------------------- 基础工具
+missing=()
+for c in awk ping curl timeout; do
+  command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+done
+if (( ${#missing[@]} )); then
+  echo "${R}缺少基础命令: ${missing[*]}${N}"
+  echo "Debian/Ubuntu: apt update && apt install -y iputils-ping curl coreutils"
+  echo "RHEL/CentOS : yum install -y iputils curl coreutils"
+  exit 1
+fi
+
+need() {
+  command -v "$1" >/dev/null 2>&1
+}
+install_pkg() {
+  local cmd=$1 pkg=$2
+  need "$cmd" && return 0
+  echo "  ${Y}缺少 $cmd ($pkg)${N}"
+  if (( INSTALL )); then
+    if need apt-get; then apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1
+    elif need yum; then yum install -y "$pkg" >/dev/null 2>&1
+    elif need dnf; then dnf install -y "$pkg" >/dev/null 2>&1
     fi
+    need "$cmd" && return 0
+  fi
+  return 1
 }
 
-# ==================== 综合评语生成函数 ====================
-generate_comment() {
-    local cpu=$1
-    local disk=$2
-    local mem=$3
-    local net=$4
-    local ip=$5
-    local route=$6
-    local stream=$7
-    local final=$8
-    local region=$9
-    local ip_type=${10}
-    
-    local comment=""
-    
-    # ---- CPU 评价 ----
-    if (( $(echo "$cpu >= 9" | bc -l 2>/dev/null) )); then
-        cpu_comment="CPU性能极强"
-    elif (( $(echo "$cpu >= 7" | bc -l 2>/dev/null) )); then
-        cpu_comment="CPU性能良好"
-    elif (( $(echo "$cpu >= 5" | bc -l 2>/dev/null) )); then
-        cpu_comment="CPU性能一般"
-    else
-        cpu_comment="CPU性能较弱"
-    fi
-    
-    # ---- 内存评价 ----
-    if (( $(echo "$mem >= 9" | bc -l 2>/dev/null) )); then
-        mem_comment="内存充裕"
-    elif (( $(echo "$mem >= 7" | bc -l 2>/dev/null) )); then
-        mem_comment="内存够用"
-    elif (( $(echo "$mem >= 4" | bc -l 2>/dev/null) )); then
-        mem_comment="内存偏小"
-    else
-        mem_comment="内存严重不足"
-    fi
-    
-    # ---- 磁盘评价 ----
-    if (( $(echo "$disk >= 9" | bc -l 2>/dev/null) )); then
-        disk_comment="磁盘极速"
-    elif (( $(echo "$disk >= 7" | bc -l 2>/dev/null) )); then
-        disk_comment="磁盘高速"
-    elif (( $(echo "$disk >= 5" | bc -l 2>/dev/null) )); then
-        disk_comment="磁盘普通"
-    else
-        disk_comment="磁盘较慢"
-    fi
-    
-    # ---- 网络评价 ----
-    if (( $(echo "$net >= 9" | bc -l 2>/dev/null) )); then
-        net_comment="网络质量优秀"
-    elif (( $(echo "$net >= 7" | bc -l 2>/dev/null) )); then
-        net_comment="网络质量良好"
-    elif (( $(echo "$net >= 5" | bc -l 2>/dev/null) )); then
-        net_comment="网络质量一般"
-    else
-        net_comment="网络质量较差"
-    fi
-    
-    # ---- 回程评价 ----
-    if (( $(echo "$route >= 9" | bc -l 2>/dev/null) )); then
-        route_comment="回程线路优质"
-    elif (( $(echo "$route >= 7" | bc -l 2>/dev/null) )); then
-        route_comment="回程线路尚可"
-    else
-        route_comment="回程线路普通"
-    fi
-    
-    # ---- IP 评价 ----
-    if echo "$ip_type" | grep -q "原生IP"; then
-        ip_comment="原生IP，风控低"
-    elif echo "$ip_type" | grep -q "广播IP"; then
-        ip_comment="广播IP，部分场景受限"
-    else
-        ip_comment="IP类型普通"
-    fi
-    
-    # ---- 流媒体评价 ----
-    if (( $(echo "$stream >= 9" | bc -l 2>/dev/null) )); then
-        stream_comment="流媒体全解锁"
-    elif (( $(echo "$stream >= 7" | bc -l 2>/dev/null) )); then
-        stream_comment="流媒体大部分解锁"
-    elif (( $(echo "$stream >= 4" | bc -l 2>/dev/null) )); then
-        stream_comment="流媒体部分解锁"
-    else
-        stream_comment="流媒体解锁能力弱"
-    fi
-    
-    # ---- 硬件概况 ----
-    hw_avg=$(awk "BEGIN {printf \"%.1f\", ($cpu + $disk + $mem) / 3}")
-    if (( $(echo "$hw_avg >= 7" | bc -l 2>/dev/null) )); then
-        hw_summary="硬件配置较好"
-    elif (( $(echo "$hw_avg >= 5" | bc -l 2>/dev/null) )); then
-        hw_summary="硬件配置中等"
-    else
-        hw_summary="硬件配置偏低"
-    fi
-    
-    # ---- 综合优势与劣势 ----
-    advantages=()
-    disadvantages=()
-    
-    # 优势
-    (( $(echo "$cpu >= 7" | bc -l 2>/dev/null) )) && advantages+=("CPU性能较强")
-    (( $(echo "$mem >= 7" | bc -l 2>/dev/null) )) && advantages+=("内存充足")
-    (( $(echo "$disk >= 7" | bc -l 2>/dev/null) )) && advantages+=("磁盘读写快")
-    (( $(echo "$net >= 8" | bc -l 2>/dev/null) )) && advantages+=("网络质量好")
-    (( $(echo "$route >= 8" | bc -l 2>/dev/null) )) && advantages+=("回程线路优质")
-    echo "$ip_type" | grep -q "原生IP" && advantages+=("原生IP")
-    (( $(echo "$stream >= 7" | bc -l 2>/dev/null) )) && advantages+=("流媒体解锁能力强")
-    
-    # 劣势
-    (( $(echo "$cpu < 5" | bc -l 2>/dev/null) )) && disadvantages+=("CPU性能较弱")
-    (( $(echo "$mem < 5" | bc -l 2>/dev/null) )) && disadvantages+=("内存较小")
-    (( $(echo "$disk < 5" | bc -l 2>/dev/null) )) && disadvantages+=("磁盘较慢")
-    (( $(echo "$net < 5" | bc -l 2>/dev/null) )) && disadvantages+=("网络质量一般")
-    (( $(echo "$route < 6" | bc -l 2>/dev/null) )) && disadvantages+=("回程线路普通")
-    echo "$ip_type" | grep -q "广播IP" && disadvantages+=("广播IP")
-    (( $(echo "$stream < 4" | bc -l 2>/dev/null) )) && disadvantages+=("流媒体解锁能力弱")
-    
-    # ---- 构建评价文本 ----
-    comment="【综合评价】$hw_summary，$net_comment。"
-    
-    # 添加优势
-    if [[ ${#advantages[@]} -gt 0 ]]; then
-        comment+="优势：$(IFS=、; echo "${advantages[*]}")"
-    fi
-    
-    # 添加劣势
-    if [[ ${#disadvantages[@]} -gt 0 ]]; then
-        comment+="；不足：$(IFS=、; echo "${disadvantages[*]}")"
-    fi
-    
-    # ---- 推荐用途 ----
-    if (( $(echo "$final >= 8.5" | bc -l 2>/dev/null) )); then
-        advice="全能型服务器，适合建站、代理、爬虫、流媒体解锁等多种场景，体验优秀。"
-    elif (( $(echo "$final >= 7.0" | bc -l 2>/dev/null) )); then
-        # 根据具体特点细分
-        if (( $(echo "$net >= 8" | bc -l 2>/dev/null) )) && echo "$ip_type" | grep -q "原生IP"; then
-            advice="适合代理、流媒体解锁或跨境业务，网络和IP质量都不错。"
-        elif (( $(echo "$cpu >= 8" | bc -l 2>/dev/null) )); then
-            advice="CPU性能突出，适合跑脚本、爬虫或轻量级计算任务。"
-        elif (( $(echo "$mem >= 8" | bc -l 2>/dev/null) )); then
-            advice="内存充足，适合建站、数据库或容器化部署。"
-        elif (( $(echo "$route >= 8" | bc -l 2>/dev/null) )); then
-            advice="回程线路好，适合对国内用户访问质量要求高的场景。"
-        elif (( $(echo "$stream >= 7" | bc -l 2>/dev/null) )); then
-            advice="流媒体解锁能力强，适合作为流媒体解锁专用机。"
-        else
-            advice="综合性能均衡，适合日常使用。"
-        fi
-    elif (( $(echo "$final >= 5.5" | bc -l 2>/dev/null) )); then
-        advice="存在明显短板，建议根据具体需求判断。如做代理请关注网络质量，建站请关注硬件配置。"
-    else
-        advice="性能较差，建议仅做备份、测试或轻量级用途。"
-    fi
-    
-    echo -e "$comment"
-    echo -e "【建议】$advice"
+ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 >= b+0)}'; }
+le() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 <= b+0)}'; }
+avg() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f",(a+b)/2}'; }
+# tier_score <value> "阈值:分数 阈值:分数 ..."  从高到低匹配
+tier_score() {
+  local v=$1; shift
+  local pair t s
+  for pair in "$@"; do
+    t=${pair%%:*}; s=${pair##*:}
+    ge "$v" "$t" && { echo "$s"; return; }
+  done
+  echo 2
 }
 
-if ! command -v bc &> /dev/null; then
-    apt install bc -y >/dev/null 2>&1 || yum install bc -y >/dev/null 2>&1
+declare -A SCORE=() RAW=() NOTE=() NAME=()
+record() { SCORE[$1]=$2; RAW[$1]=$3; NOTE[$1]=${4:-}; }
+skip()   { SCORE[$1]="";  RAW[$1]=$2; NOTE[$1]=${3:-}; }
+NAME[cpu_single]="CPU单核"
+NAME[cpu_multi]="CPU多核扩展"
+NAME[steal]="超售/抢占"
+NAME[disk_rand]="磁盘随机IO"
+NAME[disk_seq]="磁盘顺序吞吐"
+NAME[mem]="可用内存"
+NAME[net_latency]="网络延迟"
+NAME[net_loss]="网络丢包"
+NAME[net_bw]="带宽"
+NAME[route_cn]="国内去程线路"
+NAME[ip_rep]="IP信誉"
+NAME[media]="流媒体适配"
+NAME[ports]="出站端口"
+
+MODE_NAME="完整模式"; (( QUICK )) && MODE_NAME="快速模式"
+echo "${B}=========================================${N}"
+echo "${B} VPS 评测 v6.0 — 场景化评分 (${MODE_NAME})${N}"
+echo "${B} 测不到 → N/A，不估算；一次跑完，按场景分别出分${N}"
+echo "${B}=========================================${N}"
+
+# ---------------------------------------------------------------- 1. CPU
+echo -e "\n${Y}[1/8] CPU 性能与超售情况${N}"
+cpu_model=$(awk -F: '/^model name/{gsub(/^ +| +$/,"",$2); print $2; exit}' /proc/cpuinfo)
+cores=$(nproc 2>/dev/null || echo 1)
+echo "  型号: ${cpu_model:-未知} | 逻辑核: $cores"
+
+steal_mode="unknown"; steal_val=""
+if [[ -r /proc/stat ]]; then
+  read -r t1 s1 < <(awk '/^cpu /{t=0; for(i=2;i<=NF;i++)t+=$i; print t, ($9==""?"-1":$9)}' /proc/stat)
+  sleep 1
+  read -r t2 s2 < <(awk '/^cpu /{t=0; for(i=2;i<=NF;i++)t+=$i; print t, ($9==""?"-1":$9)}' /proc/stat)
+  if [[ "$s1" != "-1" && "$s2" != "-1" ]]; then
+    steal_mode="ok"
+    # 取两段采样的较大值，避免瞬时低抢占掩盖问题
+    steal_val=$(awk -v a="$s1" -v b="$s2" -v ta="$t1" -v tb="$t2" \
+      'BEGIN{d1=ta>0?(a/ta*100):0; d2=tb>0?(b/tb*100):0; printf "%.2f",(d1>d2?d1:d2)}')
+  fi
+fi
+if [[ "$steal_mode" == "ok" ]]; then
+  ss=$(tier_score "$steal_val" "1:10 3:8 6:6 10:4")
+  record steal "$ss" "${steal_val}% (1s采样峰值)" "steal 越低越好；>5% 通常意味着明显超售"
+  echo "  steal: ${steal_val}% -> ${ss}/10"
+else
+  skip steal "不可读" "容器/内核未暴露 steal 字段，该项不计分"
+  echo "  ${D}steal 不可读，跳过${N}"
 fi
 
-echo -e "${BLUE}=========================================${NC}"
-echo -e "${BLUE}   🧠 VPS 专业评分引擎 v5.11       ${NC}"
-echo -e "${BLUE}   新增：综合评语 & 使用建议        ${NC}"
-echo -e "${BLUE}=========================================${NC}"
-
-echo -e "\n${YELLOW}📟 [1/7] CPU 性能检测...${NC}"
-if ! command -v sysbench &> /dev/null; then
-    apt install sysbench -y >/dev/null 2>&1 || yum install sysbench -y >/dev/null 2>&1
-fi
-
-# 获取 CPU 型号
-cpu_model=$(lscpu | grep "Model name" | head -1 | awk -F':' '{print $2}' | xargs)
-if [[ -z "$cpu_model" ]]; then
-    cpu_model=$(cat /proc/cpuinfo | grep "model name" | head -1 | awk -F':' '{print $2}' | xargs)
-fi
-echo -e "   CPU型号: ${cpu_model:-未知}"
-
-sysbench cpu --threads=1 --time=5 run > /tmp/cpu_single.log 2>&1
-single_score=$(grep "events per second:" /tmp/cpu_single.log | awk '{print $4}' | cut -d. -f1)
-cores=$(nproc)
-sysbench cpu --threads=$cores --time=5 run > /tmp/cpu_multi.log 2>&1
-multi_score=$(grep "events per second:" /tmp/cpu_multi.log | awk '{print $4}' | cut -d. -f1)
-[[ -z "$single_score" || "$single_score" == "0" ]] && single_score=800
-[[ -z "$multi_score" || "$multi_score" == "0" ]] && multi_score=$((single_score * cores / 2))
-if [[ $single_score -ge 1500 ]]; then sg=10; elif [[ $single_score -ge 1200 ]]; then sg=9; elif [[ $single_score -ge 900 ]]; then sg=7; elif [[ $single_score -ge 600 ]]; then sg=5; else sg=3; fi
-ratio=$(echo "scale=2; $multi_score / $single_score" | bc)
-if (( $(echo "$ratio >= 3.5" | bc -l) )); then mg=10; elif (( $(echo "$ratio >= 2.5" | bc -l) )); then mg=8; elif (( $(echo "$ratio >= 1.8" | bc -l) )); then mg=6; else mg=4; fi
-cpu_score=$(echo "scale=1; $sg * 0.6 + $mg * 0.4" | bc)
-echo -e "   单核: ${single_score}分 | 多核: ${multi_score}分 (${cores}核) -> ${cpu_score}/10"
-
-echo -e "\n${YELLOW}💾 [2/7] 磁盘与内存性能检测...${NC}"
-
-# ==================== 磁盘设备信息 ====================
-root_dev=$(df -h / | tail -1 | awk '{print $1}')
-if [[ -n "$root_dev" ]]; then
-    dev_name=$(basename "$root_dev")
-    if [[ "$dev_name" == vd* ]]; then
-        dev_type="virtio"
-    elif [[ "$dev_name" == nvme* ]]; then
-        dev_type="nvme"
-    elif [[ "$dev_name" == sd* ]]; then
-        dev_type="sata/scsi"
-    elif [[ "$dev_name" == xvd* ]]; then
-        dev_type="xen"
+if install_pkg sysbench sysbench; then
+  sbver=$(sysbench --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  if [[ "$(echo "${sbver:-0}" | cut -d. -f1)" -ge 1 ]]; then
+    singles=()
+    for i in 1 2 3; do
+      out=$(timeout 20 sysbench cpu --cpu-max-prime=20000 --threads=1 --time=3 run 2>/dev/null)
+      v=$(echo "$out" | awk -F: '/events per second/{gsub(/ /,"",$2); print $2; exit}')
+      [[ -n "$v" ]] && singles+=("$v")
+    done
+    if (( ${#singles[@]} )); then
+      single=$(printf '%s\n' "${singles[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+      s1=$(tier_score "$single" "2500:10 1800:9 1300:8 900:6 600:4")
+      record cpu_single "$s1" "${single} events/s (3取中位)" "sysbench $sbver，单核；数值因版本/prime参数而异，仅作相对参考"
+      echo "  单核(中位): ${single} events/s -> ${s1}/10"
+      # 多核扩展效率
+      mout=$(timeout 20 sysbench cpu --cpu-max-prime=20000 --threads="$cores" --time=3 run 2>/dev/null)
+      multi=$(echo "$mout" | awk -F: '/events per second/{gsub(/ /,"",$2); print $2; exit}')
+      if [[ -n "$multi" ]]; then
+        eff=$(awk -v m="$multi" -v s="$single" -v c="$cores" 'BEGIN{printf "%.2f", (s>0? m/(s*c) : 0)}')
+        s2=$(tier_score "$eff" "0.9:10 0.7:8 0.5:6 0.3:4")
+        record cpu_multi "$s2" "扩展效率 ${eff}x (${multi} events/s)" "多核 / (单核×逻辑核)；接近 1 说明扩展良好"
+        echo "  多核扩展: ${eff}x -> ${s2}/10"
+      else
+        skip cpu_multi "无数据" "多核测试失败"
+      fi
     else
-        dev_type="unknown"
+      skip cpu_single "无数据" "sysbench 运行失败，可能是环境限制"
+      skip cpu_multi "无数据" "sysbench 运行失败"
     fi
-    echo -e "   磁盘设备: $root_dev ($dev_type)"
+  else
+    skip cpu_single "sysbench ${sbver:-旧版}" "sysbench <1.0 的结果与新版不可比，不给分"
+    skip cpu_multi "sysbench ${sbver:-旧版}" "同上"
+  fi
 else
-    echo -e "   磁盘设备: 无法获取"
+  skip cpu_single "未安装 sysbench" "加 --install-deps 自动安装，或手动 apt/yum install sysbench"
+  skip cpu_multi "未安装 sysbench" "同上"
 fi
 
-# ==================== 磁盘性能测试 ====================
-disk_score=0
-iops="N/A"
+# ---------------------------------------------------------------- 2. 磁盘
+echo -e "\n${Y}[2/8] 磁盘性能${N}"
+root_dev=$(df -P / 2>/dev/null | awk 'NR==2{print $1}')
+root_size=$(df -h / 2>/dev/null | awk 'NR==2{print $2}')
+echo "  根分区: ${root_dev:-未知} (${root_size:-未知})"
 
-if ! command -v fio &> /dev/null; then
-    apt install fio -y >/dev/null 2>&1 || yum install fio -y >/dev/null 2>&1
+if install_pkg fio fio; then
+  fio_iops() {
+    local mode=$1 bs=$2 rw=$3 runtime=$4
+    timeout $((runtime+8)) fio --name=vpscheck --directory="$WORKDIR" --size=128m \
+      --bs="$bs" --rw="$rw" --ioengine=libaio --direct=1 --iodepth=32 --numjobs=1 \
+      --runtime="$runtime" --time_based --group_reporting 2>/dev/null
+  }
+  parse_iops() {
+    local out=$1 kind=$2 v
+    v=$(echo "$out" | grep -oE "${kind}: IOPS=[0-9.]+[kK]?" | head -1 | grep -oE '[0-9.]+[kK]?' | head -1)
+    [[ -z "$v" ]] && { echo ""; return; }
+    if [[ "$v" =~ [kK]$ ]]; then awk -v x="${v%[kK]}" 'BEGIN{printf "%.0f",x*1000}'
+    else awk -v x="$v" 'BEGIN{printf "%.0f",x}'; fi
+  }
+  rt=5; [[ $QUICK -eq 1 ]] && rt=2
+  out_r=$(fio_iops r 4k randread "$rt")
+  out_w=$(fio_iops w 4k randwrite "$rt")
+  ior=$(parse_iops "$out_r" read); iow=$(parse_iops "$out_w" write)
+  p99=$(echo "$out_r" | grep -oE '99\.00th=\[[^]]+\]' | head -1 | grep -oE '[0-9.]+[kK]?' | head -1)
+  if [[ -n "$ior" && -n "$iow" ]]; then
+    sr=$(tier_score "$ior" "100000:10 50000:9 20000:8 10000:6 3000:4")
+    sw=$(tier_score "$iow" "100000:10 50000:9 20000:8 10000:6 3000:4")
+    base=$(( sr < sw ? sr : sw ))
+    penalty=0
+    if [[ -n "$p99" ]]; then
+      p99n=${p99%[kK]}; [[ "$p99" =~ [kK]$ ]] && p99n=$(awk -v x="$p99n" 'BEGIN{printf "%.0f",x*1000}')
+      ge "$p99n" 50000 && penalty=2 || { ge "$p99n" 20000 && penalty=1; }
+    fi
+    ds=$(( base > penalty ? base-penalty : 1 ))
+    record disk_rand "$ds" "读${ior} / 写${iow} IOPS, p99≈${p99:-?}us" "4K 随机，direct=1；读写取较低值，高尾延迟扣分"
+    echo "  4K随机: 读${ior} / 写${iow} IOPS -> ${ds}/10"
+  else
+    skip disk_rand "fio 无有效输出" "可能后端不支持 direct I/O；不改用缓存测法，避免虚高"
+    echo "  ${D}fio 输出无效，跳过${N}"
+  fi
+  out_s=$(fio_iops s 1m read 3)
+  bw_line=$(echo "$out_s" | grep -oE 'read:.*BW=[0-9.]+[MG]iB/s' | head -1)
+  bw=$(echo "$bw_line" | grep -oE 'BW=[0-9.]+' | head -1 | cut -d= -f2)
+  bw_unit=$(echo "$bw_line" | grep -oE '[MG]iB/s' | head -1)
+  if [[ -n "$bw" ]]; then
+    [[ "$bw_unit" == "MiB/s" ]] && bw=$(awk -v x="$bw" 'BEGIN{printf "%.0f",x/1024}')
+    ss=$(tier_score "$bw" "1000:10 500:9 200:8 100:6 50:4")
+    record disk_seq "$ss" "${bw} GiB/s (${bw_unit})" "1M 顺序读"
+    echo "  顺序读: ${bw} ${bw_unit} -> ${ss}/10"
+  else
+    skip disk_seq "无数据" "顺序读测试失败"
+  fi
+else
+  skip disk_rand "未安装 fio" "加 --install-deps 或手动安装"
+  skip disk_seq "未安装 fio" "同上"
 fi
 
-echo -e "   ${YELLOW}正在测试4K随机读写性能...${NC}"
-fio_output=$(timeout 10 fio --name=4k_read --directory=/tmp --size=128M --bs=4k --rw=randread --ioengine=libaio --direct=1 --numjobs=1 --iodepth=32 --time_based --runtime=6 --group_reporting 2>&1)
-fio_exit_code=$?
-rm -f /tmp/4k_read* 2>/dev/null
+# ---------------------------------------------------------------- 3. 内存
+echo -e "\n${Y}[3/8] 内存${N}"
+avail_kb=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo)
+[[ -z "$avail_kb" ]] && avail_kb=$(awk '/^MemFree:/{print $2; exit}' /proc/meminfo)
+avail_mb=$(awk -v x="${avail_kb:-0}" 'BEGIN{printf "%.0f",x/1024}')
+# 容器里 free 看到的是宿主机内存，用 cgroup 上限压低
+for lim in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+  [[ -r "$lim" ]] || continue
+  cv=$(cat "$lim" 2>/dev/null)
+  [[ "$cv" =~ ^[0-9]+$ ]] || continue
+  (( cv > 0 && cv < 1099511627776 )) || continue
+  cmb=$(awk -v x="$cv" 'BEGIN{printf "%.0f",x/1048576}')
+  avail_mb=$(awk -v a="$avail_mb" -v b="$cmb" 'BEGIN{printf "%.0f",(a<b?a:b)}')
+  break
+done
+swap_total=$(awk '/^SwapTotal:/{print $2; exit}' /proc/meminfo); swap_total=${swap_total:-0}
+swap_free=$(awk '/^SwapFree:/{print $2; exit}' /proc/meminfo); swap_free=${swap_free:-0}
+ms=$(tier_score "$avail_mb" "15000:10 8000:9 4000:8 2000:6 1000:4")
+note="MemAvailable，已考虑 cgroup 限制"
+if (( swap_total > 0 )); then
+  swap_used=$(( (swap_total - swap_free) * 100 / swap_total ))
+  if (( swap_used > 20 )); then ms=$(( ms > 2 ? ms-2 : 1 )); note+="；swap 已用 ${swap_used}%，扣分"; fi
+fi
+record mem "$ms" "${avail_mb} MB 可用 / 总 $(awk -v x="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)" 'BEGIN{printf "%.0f",x/1024}') MB" "$note"
+echo "  可用内存: ${avail_mb} MB -> ${ms}/10"
 
-if [[ $fio_exit_code -ne 0 ]] || [[ -z "$fio_output" ]]; then
-    echo -e "   ${YELLOW}⚠️ fio 测试失败，磁盘得分 1 分${NC}"
-    disk_score=1
-    echo -e "   磁盘: 测试失败 -> ${disk_score}/10"
+# ---------------------------------------------------------------- 4. 网络延迟与丢包
+echo -e "\n${Y}[4/8] 网络延迟与丢包 (多节点，5包取中位)${N}"
+targets=("114.114.114.114" "223.5.5.5" "119.29.29.29" "219.141.140.10" "202.106.195.68" "120.196.165.24")
+rtts=(); losses=(); ok=0
+for ip in "${targets[@]}"; do
+  po=$(timeout 8 ping -n -q -c 5 -i 0.2 -W 1 "$ip" 2>/dev/null)
+  loss=$(echo "$po" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p')
+  rtt=$(echo "$po"  | sed -n 's#.* = \([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\) ms#\2#p')
+  [[ -z "$loss" ]] && loss=100
+  losses+=("$loss")
+  if [[ -n "$rtt" ]]; then rtts+=("$rtt"); ok=$((ok+1)); fi
+  echo "  ${ip}: ${rtt:-超时} ms / 丢包 ${loss}%"
+done
+if (( ok == 0 )); then
+  skip net_latency "全部超时" "ICMP 被完全丢弃或网络不通，按规则不估算延迟"
+  skip net_loss   "全部超时" "同上"
 else
-    iops_raw=$(echo "$fio_output" | grep -oE 'read:.*IOPS=[0-9.]+[kK]?' | head -1 | grep -oE '[0-9.]+[kK]?' | head -1)
-    if [[ -n "$iops_raw" ]]; then
-        if [[ "$iops_raw" =~ [kK]$ ]]; then
-            iops_num=$(echo "$iops_raw" | sed 's/[kK]$//')
-            iops=$(printf "%.0f" "$(echo "$iops_num * 1000" | bc 2>/dev/null)")
-        else
-            iops=$(printf "%.0f" "$iops_raw")
-        fi
-    fi
-    if [[ -z "$iops" || "$iops" == "0" ]]; then
-        iops=$(echo "$fio_output" | grep -oE 'iops[[:space:]]*:[[:space:]]*.*avg=[0-9.]+' | grep -oE 'avg=[0-9.]+' | head -1 | cut -d= -f2 | cut -d. -f1)
-    fi
+  med=$(printf '%s\n' "${rtts[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+  ls=$(awk -v n="${#losses[@]}" 'BEGIN{s=0} {s+=$1} END{printf "%.1f",s/n}' <<<"$(printf '%s\n' "${losses[@]}")")
+  lscore=$(tier_score "$med" "50:10 100:9 150:8 250:6 400:4")
+  loss_score=$(tier_score "$ls" "0.1:10 1:9 3:7 5:5 10:3")
+  record net_latency "$lscore" "${med} ms (中位)" "到国内常用节点，非本地运营商专线口径"
+  record net_loss "$loss_score" "${ls}% 平均丢包" "6节点×5包，含失败节点计 100%"
+  echo "  延迟中位: ${med} ms -> ${lscore}/10 | 平均丢包 ${ls}% -> ${loss_score}/10"
+fi
 
-    if [[ -n "$iops" && "$iops" -gt 500 ]]; then
-        if [[ $iops -ge 500000 ]]; then disk_score=10; disk_desc="极速NVMe(${iops} IOPS)"
-        elif [[ $iops -ge 200000 ]]; then disk_score=9; disk_desc="高性能NVMe(${iops} IOPS)"
-        elif [[ $iops -ge 80000 ]]; then disk_score=8; disk_desc="标准NVMe(${iops} IOPS)"
-        elif [[ $iops -ge 30000 ]]; then disk_score=6; disk_desc="优秀SSD(${iops} IOPS)"
-        elif [[ $iops -ge 10000 ]]; then disk_score=4; disk_desc="普通SSD(${iops} IOPS)"
-        else disk_score=2; disk_desc="慢速盘(${iops} IOPS)"; fi
-        echo -e "   4K随机读: ${iops} IOPS -> ${disk_score}/10 ($disk_desc)"
+# ---------------------------------------------------------------- 5. 去程线路
+echo -e "\n${Y}[5/8] 国内去程线路 (注意：这是去程，不是回程)${N}"
+if [[ $QUICK -eq 1 ]]; then
+  skip route_cn "快速模式跳过" "完整模式运行 traceroute -T"
+else
+  if install_pkg traceroute traceroute; then
+    rnodes=("219.141.140.10:电信" "210.22.97.1:联通" "120.196.165.24:移动")
+    rsum=0; rcnt=0; rdesc=()
+    for item in "${rnodes[@]}"; do
+      rip=${item%%:*}; rname=${item##*:}
+      tr=$(timeout 12 traceroute -T -p 80 -m 15 -w 1 -n "$rip" 2>/dev/null)
+      [[ -n "$tr" ]] || tr=$(timeout 12 traceroute -I -m 15 -w 1 -n "$rip" 2>/dev/null)
+      if [[ -z "$tr" ]]; then
+        rdesc+=("${rname}:探测失败"); continue
+      fi
+      # 匹配具体 ASN / 网段，避免 "163" 这类裸数字误把延迟当线路
+      if echo "$tr" | grep -qE '59\.43\.|AS4809|AS4809 '; then sc=10; lab="CN2 GIA"
+      elif echo "$tr" | grep -qE 'AS9929|AS4837|219\.158|AS4808'; then sc=8; lab="联通精品/4837"
+      elif echo "$tr" | grep -qE 'AS58453|AS9808|AS56041'; then sc=7; lab="移动CMI"
+      elif echo "$tr" | grep -qE 'AS4134|AS4812|61\.|202\.9[0-9]'; then sc=5; lab="电信163/普通"
+      else sc=4; lab="普通/未知"; fi
+      rsum=$((rsum+sc)); rcnt=$((rcnt+1)); rdesc+=("${rname}:${lab}")
+    done
+    if (( rcnt > 0 )); then
+      ravg=$(( (rsum+rcnt/2) / rcnt ))
+      record route_cn "$ravg" "$(IFS=,; echo "${rdesc[*]}")" "仅去程；真实回程需从国内探针测，本机无法得出"
+      echo "  $(IFS=' '; echo "${rdesc[*]}") -> ${ravg}/10"
     else
-        echo -e "   ${YELLOW}⚠️ 无法获取有效 IOPS，磁盘得分 1 分${NC}"
-        disk_score=1
-        echo -e "   磁盘: 无有效数据 -> ${disk_score}/10"
+      skip route_cn "全部探测失败" "不给默认分"
     fi
+  else
+    skip route_cn "未安装 traceroute" "加 --install-deps 或手动安装"
+  fi
 fi
 
-# ==================== 内存检测 ====================
-mem_total=$(free -m | awk '/Mem:/{print $2}')
-if [[ -z "$mem_total" || "$mem_total" == "0" ]]; then
-    mem_score=1
-    mem_desc="无法检测(给最低分)"
+# ---------------------------------------------------------------- 6. 带宽
+echo -e "\n${Y}[6/8] 带宽${N}"
+if [[ $QUICK -eq 1 ]]; then
+  skip net_bw "快速模式跳过" "完整模式运行 speedtest-cli"
+elif install_pkg speedtest-cli speedtest-cli; then
+  vals=()
+  runs=2
+  for i in $(seq 1 $runs); do
+    so=$(timeout 75 speedtest-cli --simple 2>/dev/null)
+    d=$(echo "$so" | awk '/^Download:/{print $2; exit}')
+    [[ -n "$d" ]] && vals+=("$d")
+  done
+  if (( ${#vals[@]} )); then
+    bw=$(printf '%s\n' "${vals[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+    bs=$(tier_score "$bw" "500:10 200:9 100:8 50:7 20:5 10:3")
+    record net_bw "$bs" "${bw} Mbps 下行 (${#vals[@]}/${runs} 次成功，取中位)" "speedtest-cli 单服务器结果，仅作参考；不取最大值"
+    echo "  下行中位: ${bw} Mbps -> ${bs}/10"
+  else
+    skip net_bw "测速失败" "不给默认分"
+  fi
 else
-    if [[ $mem_total -ge 14000 ]]; then mem_score=10; mem_desc="超大(≥16G)"
-    elif [[ $mem_total -ge 7000 ]]; then mem_score=9; mem_desc="大内存(8G)"
-    elif [[ $mem_total -ge 3500 ]]; then mem_score=7; mem_desc="充足(4G)"
-    elif [[ $mem_total -ge 1800 ]]; then mem_score=5; mem_desc="够用(2G)"
-    elif [[ $mem_total -ge 900 ]]; then mem_score=3; mem_desc="勉强(1G)"
-    else mem_score=1; mem_desc="极小(<1G)"; fi
+  skip net_bw "未安装 speedtest-cli" "加 --install-deps 或手动安装"
 fi
-echo -e "   内存: ${mem_total:-0}MB -> ${mem_score}/10 ($mem_desc)"
 
-echo -e "\n${YELLOW}📍 [3/7] IP地理位置与类型...${NC}"
-geo=$(curl -s --max-time 3 http://ip-api.com/json/)
+# ---------------------------------------------------------------- 7. IP 信息（不直接加分）
+echo -e "\n${Y}[7/8] IP 信息${N}"
+ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+geo=$(curl -s --max-time 5 'http://ip-api.com/json/?fields=status,country,countryCode,city,isp,as,hosting' 2>/dev/null)
 if [[ -n "$geo" ]]; then
-    country=$(echo "$geo" | grep -o '"country":"[^"]*"' | head -1 | cut -d'"' -f4)
-    city=$(echo "$geo" | grep -o '"city":"[^"]*"' | head -1 | cut -d'"' -f4)
-    isp=$(echo "$geo" | grep -o '"isp":"[^"]*"' | head -1 | cut -d'"' -f4)
-    as_info=$(echo "$geo" | grep -o '"as":"[^"]*"' | head -1 | cut -d'"' -f4)
-    country_code=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
-    echo -e "   位置: $country - $city | 运营商: $isp"
-    echo -e "   ASN信息: $as_info"
-    
-    # ---- 参考 ping0.cc 标准判断原生IP ----
-    ip_type="未知"
-    ip_bonus=0
-    reg_country=""
-    
-    # 方式1：从 ipinfo.io 获取注册国（最准确）
-    reg_country=$(curl -s --max-time 3 https://ipinfo.io/country 2>/dev/null)
-    if [[ -n "$reg_country" && "$reg_country" == "$country_code" ]]; then
-        ip_type="原生IP ✓ (注册国=$reg_country，定位国=$country_code)"
-        ip_bonus=2
-    elif [[ -n "$reg_country" && "$reg_country" != "$country_code" ]]; then
-        ip_type="广播IP (注册国=$reg_country，定位国=$country_code)"
-        ip_bonus=0
-    else
-        # 备选：从 as_info 中猜测
-        as_org=$(echo "$as_info" | sed 's/^AS[0-9]* //')
-        if echo "$as_org" | grep -qiE "HK|Hong Kong|Japan|Singapore|Korea|Taiwan|China|CN"; then
-            if [[ "$country_code" == "HK" || "$country_code" == "JP" || "$country_code" == "SG" || "$country_code" == "KR" || "$country_code" == "TW" || "$country_code" == "CN" ]]; then
-                ip_type="原生IP ✓ (ASN注册地与位置一致)"
-                ip_bonus=2
-            else
-                ip_type="广播IP (ASN亚洲但位置在非亚洲)"
-                ip_bonus=0
-            fi
-        else
-            ip_type="未知 (无法确定注册国)"
-            ip_bonus=0
-        fi
-    fi
-    
-    echo -e "   IP类型: $ip_type ($([ $ip_bonus -gt 0 ] && echo "+${ip_bonus}分" || echo "不加分"))"
-    
-    # 设置 region
-    if [[ "$country" == "Hong Kong" || "$country" == "Japan" || "$country" == "Singapore" || "$country" == "South Korea" || "$country" == "Taiwan" ]]; then
-        base_ip=9
-        region="亚洲"
-    elif [[ "$country" == "United States" ]]; then
-        if [[ "$city" == "Los Angeles" || "$city" == "San Jose" || "$city" == "Seattle" ]]; then
-            base_ip=7
-            region="美西"
-        else
-            base_ip=5
-            region="美东/中部"
-        fi
-    elif [[ "$country" == "Germany" || "$country" == "Netherlands" || "$country" == "United Kingdom" ]]; then
-        base_ip=3
-        region="欧洲"
-    elif [[ "$country" == "Malaysia" || "$country" == "Vietnam" || "$country" == "Thailand" || "$country" == "Indonesia" || "$country" == "Philippines" ]]; then
-        base_ip=6
-        region="亚洲"
-    else
-        base_ip=5
-        region="其他"
-    fi
-    
-    score_ip=$((base_ip + ip_bonus))
-    [[ $score_ip -gt 10 ]] && score_ip=10
-    echo -e "   体质: ${score_ip}/10 ($region) [基础分:$base_ip + 类型加分:$ip_bonus]"
+  country=$(echo "$geo" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')
+  city=$(echo "$geo" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
+  isp=$(echo "$geo" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')
+  asn=$(echo "$geo" | sed -n 's/.*"as":"\([^"]*\)".*/\1/p')
+  echo "  IP: ${ip:-未知} | ${country:-?} ${city:-?} | ${isp:-?}"
+  echo "  ASN: ${asn:-?} | hosting: $(echo "$geo" | grep -oE '"hosting":(true|false)' | head -1 | cut -d: -f2)"
+fi
+# 注册国/定位国只作为提示，不做「原生+2 / 广播-?」的伪科学加分
+reg=$(curl -s --max-time 5 https://ipinfo.io/country 2>/dev/null | grep -oE '^[A-Z]{2}$' | head -1)
+cc=$(echo "$geo" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
+if [[ -n "$reg" && -n "$cc" ]]; then
+  echo "  ${D}注册国=$reg / 定位国=$cc （差异只作参考，不计分：两家数据库更新不同步很常见）${N}"
+fi
+# DNSBL 反查，真实信誉信号
+if [[ -n "$ip" ]] && (need dig || need host || need getent); then
+  rev=$(echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')
+  if need dig; then ans=$(timeout 5 dig +short "${rev}.zen.spamhaus.org" 2>/dev/null)
+  elif need host; then ans=$(timeout 5 host "${rev}.zen.spamhaus.org" 2>/dev/null | grep -oE '127\.0\.0\.[0-9]+' | head -1)
+  else ans=$(timeout 5 getent hosts "${rev}.zen.spamhaus.org" 2>/dev/null | awk '{print $1}'); fi
+  if [[ -n "$ans" ]]; then
+    record ip_rep 2 "命中 Spamhaus: ${ans}" "被主流反垃圾库标记，邮件/注册类业务风险高"
+    echo "  ${R}IP 信誉: 命中 Spamhaus${N}"
+  else
+    record ip_rep 9 "Spamhaus 未命中" "仅代表未上反垃圾库，不等于平台不封"
+    echo "  IP 信誉: Spamhaus 未命中"
+  fi
 else
-    country="未知"
-    city="未知"
-    isp="未知"
-    country_code=""
-    score_ip=5
-    region="其他"
-    ip_type="无法检测"
-    echo -e "   ${YELLOW}⚠️ 无法获取IP地理位置信息，使用默认值${NC}"
+  skip ip_rep "无法查询" "缺少 IP 或 DNS 工具，不给默认分"
 fi
 
-echo -e "\n${YELLOW}🌐 [4/7] 延迟 & TikTok解锁...${NC}"
+# ---------------------------------------------------------------- 8. 流媒体与端口
+echo -e "\n${Y}[8/8] 流媒体可用性 & 出站端口${N}"
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+http_code() { curl -sL -o /dev/null -w '%{http_code}' --max-time 8 -A "$UA" "$1" 2>/dev/null; }
+passed=0; total=0
+nf=$(http_code 'https://www.netflix.com/title/81280792')
+[[ "$nf" == "200" || "$nf" == "404" ]] && passed=$((passed+1)); total=$((total+1))
+echo "  Netflix: ${nf:-无响应} ($([[ "$nf" == "200" || "$nf" == "404" ]] && echo 可用 || echo 不可用))"
+yt=$(curl -s --max-time 8 -H 'Accept-Language: en' 'https://www.youtube.com/premium' 2>/dev/null)
+if echo "$yt" | grep -q 'YouTube and YouTube Music ad-free'; then passed=$((passed+1)); fi
+total=$((total+1)); echo "  YouTube Premium: $(echo "$yt" | grep -q 'ad-free' && echo 可用 || echo 不可用)"
+tt=$(curl -s --max-time 8 -A "$UA" 'https://www.tiktok.com/' 2>/dev/null)
+ttc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -A "$UA" 'https://www.tiktok.com/' 2>/dev/null)
+[[ "$ttc" == "200" ]] && passed=$((passed+1)); total=$((total+1))
+echo "  TikTok: ${ttc:-无响应}"
+cg=$(curl -s --max-time 8 'https://chat.openai.com/cdn-cgi/trace' 2>/dev/null | awk -F= '/^loc=/{print $2}')
+[[ -n "$cg" && "$cg" != "XX" ]] && passed=$((passed+1)); total=$((total+1))
+echo "  ChatGPT: ${cg:-不可达}"
+bili=$(curl -s --max-time 8 -A "$UA" 'https://api.bilibili.com/pgc/player/web/playurl?avid=82846771&ep_id=307247&fnval=0' 2>/dev/null | grep -oE '"code":[0-9]+' | head -1 | cut -d: -f2)
+[[ "$bili" == "0" ]] && passed=$((passed+1)); total=$((total+1))
+echo "  Bilibili: $([[ "$bili" == "0" ]] && echo 大陆可用 || echo 不可用)"
+[[ $total -gt 0 ]] && record media "$(( passed*10/total ))" "${passed}/${total} 项可用" "流媒体是用途不是机器质量；只在该场景权重里起作用"
 
-echo -e "   ${YELLOW}正在测试到各地域的延迟...${NC}"
-declare -A delay_nodes=(
-    ["114DNS(全国)"]="114.114.114.114"
-    ["中科院(北京)"]="159.226.8.6"
-    ["百度(全国CDN)"]="www.baidu.com"
-    ["北京联通(北京)"]="123.123.123.123"
-    ["腾讯云(全国Anycast)"]="119.29.29.29"
-    ["阿里云(全国Anycast)"]="223.5.5.5"
-)
+pc=0; plist=()
+for ep in '1.1.1.1:443:DNS-over-TLS' 'www.google.com:80:HTTP' 'smtp.gmail.com:25:SMTP'; do
+  eh=${ep%%:*}; rest=${ep#*:}; epport=${rest%%:*}; elab=${rest##*:}
+  if timeout 3 bash -c "echo >/dev/tcp/$eh/$epport" 2>/dev/null; then pc=$((pc+1)); plist+=("$elab✓"); else plist+=("$elab✗"); fi
+done
+record ports "$(( pc*10/3 ))" "$(IFS=' '; echo "${plist[*]}")" "仅出站可达性；入站端口需在外部扫描，本机测不了"
+echo "  出站端口: $(IFS=' '; echo "${plist[*]}")"
 
-all_latencies=()
-delay_details=()
+# ---------------------------------------------------------------- 场景权重
+# 每个场景权重之和 = 1.00；N/A 项权重自动从分母移除
+profiles() {
+cat <<'EOF'
+通用|cpu_single:0.12 cpu_multi:0.08 steal:0.12 disk_rand:0.12 disk_seq:0.06 mem:0.12 net_latency:0.10 net_loss:0.10 net_bw:0.10 ports:0.08
+建站|cpu_single:0.14 cpu_multi:0.06 steal:0.12 disk_rand:0.14 disk_seq:0.04 mem:0.16 net_latency:0.12 net_loss:0.10 net_bw:0.08 ports:0.04
+跨境代理|cpu_single:0.05 cpu_multi:0.03 steal:0.08 disk_rand:0.04 disk_seq:0.02 mem:0.06 net_latency:0.18 net_loss:0.18 net_bw:0.10 route_cn:0.12 ip_rep:0.10 media:0.04
+流媒体|cpu_single:0.05 cpu_multi:0.03 steal:0.06 disk_rand:0.03 disk_seq:0.02 mem:0.05 net_latency:0.10 net_loss:0.08 net_bw:0.10 ip_rep:0.20 media:0.28
+计算|cpu_single:0.20 cpu_multi:0.26 steal:0.20 disk_rand:0.10 disk_seq:0.08 mem:0.12 net_latency:0.02 net_loss:0.02
+下载存储|cpu_single:0.04 cpu_multi:0.04 steal:0.08 disk_rand:0.10 disk_seq:0.22 mem:0.06 net_bw:0.34 net_loss:0.12
+EOF
+}
 
-for name in "${!delay_nodes[@]}"; do
-    ip="${delay_nodes[$name]}"
-    ping_result=$(ping -c 1 -W 2 "$ip" 2>/dev/null | grep 'time=' | awk -F 'time=' '{print $2}' | cut -d ' ' -f1)
-    if [[ -n "$ping_result" ]]; then
-        lat=$(printf "%.1f" "$ping_result")
-        all_latencies+=("$lat")
-        delay_details+=("   ${name}: ${lat}ms")
-    else
-        delay_details+=("   ${name}: 超时")
-    fi
+echo -e "\n${B}=========================================${N}"
+echo -e "${B} 分项结果${N}"
+echo -e "${B}=========================================${N}"
+printf "  %-14s %-8s %-40s %s\n" "指标" "得分" "测量值" "备注"
+order=(cpu_single cpu_multi steal disk_rand disk_seq mem net_latency net_loss net_bw route_cn ip_rep media ports)
+for k in "${order[@]}"; do
+  s=${SCORE[$k]:-}
+  if [[ -z "$s" ]]; then printf "  ${D}%-14s %-8s %s${N}\n" "${NAME[$k]}" "N/A" "${RAW[$k]:-}";
+  else printf "  %-14s %-8s %-40s %s\n" "${NAME[$k]}" "${s}/10" "${RAW[$k]:-}" "${NOTE[$k]:-}"; fi
 done
 
-echo -e "   ${GREEN}延迟测试结果:${NC}"
-for detail in "${delay_details[@]}"; do
-    echo -e "   $detail"
+echo -e "\n${B}=========================================${N}"
+echo -e "${B} 场景评分（同一台机器，不同用途）${N}"
+echo -e "${B}=========================================${N}"
+declare -A PSCORE=() PCOVER=()
+best=""; bestv=-1
+while IFS='|' read -r pname wlist; do
+  [[ -z "$pname" ]] && continue
+  num=""; den=""
+  for spec in $wlist; do
+    k=${spec%%:*}; w=${spec##*:}; v=${SCORE[$k]:-}
+    [[ -z "$v" ]] && continue
+    num="${num}+${w}*${v}"; den="${den}+${w}"
+  done
+  if [[ -z "$den" ]]; then
+    printf "  %-10s %s\n" "$pname" "N/A — 无可用指标"; continue
+  fi
+  val=$(awk "BEGIN{printf \"%.1f\", (${num:1})/(${den:1})}")
+  cov=${den:1}
+  cov=$(awk "BEGIN{printf \"%.2f\", ${den:1}}")
+  PSCORE[$pname]=$val; PCOVER[$pname]=$cov
+  if awk -v a="$val" -v b="$bestv" 'BEGIN{exit !(a>b)}'; then best=$pname; bestv=$val; fi
+done < <(profiles)
+for pname in "${!PSCORE[@]}"; do
+  bar_n=$(awk -v v="${PSCORE[$pname]}" 'BEGIN{printf "%d", v*2}')
+  bar=$(printf '%0.s█' $(seq 1 "$bar_n" 2>/dev/null))
+  printf "  %-10s %s/10 %-22s 覆盖权重 %s\n" "$pname" "${PSCORE[$pname]}" "$bar" "${PCOVER[$pname]}"
 done
 
-if [[ ${#all_latencies[@]} -gt 0 ]]; then
-    sum=0
-    for lat in "${all_latencies[@]}"; do
-        sum=$(echo "$sum + $lat" | bc)
-    done
-    lat_int=$(echo "scale=0; $sum / ${#all_latencies[@]}" | bc)
+# 短板：按得分升序，列出有实测值的最低 3 项
+echo -e "\n${Y}主要短板${N}"
+for k in "${!SCORE[@]}"; do
+  [[ -z "${SCORE[$k]}" ]] && continue
+  echo "${SCORE[$k]} ${NAME[$k]} ${RAW[$k]}"
+done | sort -n | head -3 | while read -r s n r; do printf "  - %-14s %s/10  (%s)\n" "$n" "$s" "$r"; done
+
+if [[ "$bestv" == "-1" ]]; then
+  echo -e "\n${Y}结论：可用指标不足，无法评分。${N}"
 else
-    case "$region" in
-        "亚洲") lat_int=60 ;;
-        "美西") lat_int=180 ;;
-        "美东/中部") lat_int=240 ;;
-        "欧洲") lat_int=260 ;;
-        *) lat_int=200 ;;
-    esac
-    echo -e "   ${YELLOW}⚠️ 所有节点均超时，使用估算延迟: ${lat_int}ms${NC}"
+  if awk -v c="${PCOVER[$best]:-0}" 'BEGIN{exit !(c<0.50)}'; then
+    echo -e "\n${Y}结论：${best} 相对最好 (${bestv}/10)，但只覆盖 ${PCOVER[$best]} 权重，样本不足，不能用于购买决策。${N}"
+  else
+    echo -e "\n${G}结论：${best} 场景表现最好 (${bestv}/10，覆盖 ${PCOVER[$best]})${N}"
+  fi
 fi
-
-case "$region" in
-    "亚洲")
-        if [[ $lat_int -le 60 ]]; then lat_score=10
-        elif [[ $lat_int -le 100 ]]; then lat_score=8
-        elif [[ $lat_int -le 150 ]]; then lat_score=6
-        else lat_score=3; fi ;;
-    "美西")
-        if [[ $lat_int -le 150 ]]; then lat_score=10
-        elif [[ $lat_int -le 180 ]]; then lat_score=8
-        elif [[ $lat_int -le 220 ]]; then lat_score=6
-        else lat_score=3; fi ;;
-    "欧洲"|"美东/中部")
-        if [[ $lat_int -le 200 ]]; then lat_score=10
-        elif [[ $lat_int -le 250 ]]; then lat_score=8
-        elif [[ $lat_int -le 300 ]]; then lat_score=6
-        else lat_score=3; fi ;;
-    *) lat_score=5 ;;
-esac
-
-echo -e "   ${GREEN}综合平均延迟: ${lat_int}ms (区域:$region) -> 得分: ${lat_score}/10${NC}"
-
-echo -e "   ${YELLOW}TikTok检测中...${NC}"
-tiktok_response=$(timeout 6 curl -sL --max-time 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://www.tiktok.com/" 2>/dev/null)
-if [[ -z "$tiktok_response" ]] || [[ "$tiktok_response" == *"timed out"* ]] || [[ "$tiktok_response" == *"curl: ("* ]]; then
-    tiktok_score=2
-    tiktok_region="无"
-    echo -e "   ${YELLOW}⚠️ TikTok 请求超时或无法访问 (给基础分)${NC}"
-else
-    tiktok_code=$(echo "$tiktok_response" | head -1 | grep -o "HTTP/.*" | tail -1 | awk '{print $2}' || echo "000")
-    if [[ -z "$tiktok_code" || "$tiktok_code" == "000" ]]; then
-        tiktok_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://www.tiktok.com/" 2>/dev/null)
-    fi
-    tiktok_score=0
-    tiktok_region="无"
-    if [[ "$tiktok_code" == "200" ]]; then
-        tiktok_region=$(echo "$tiktok_response" | grep -oE '"region":"[A-Z]{2,5}"' | head -1 | cut -d'"' -f4)
-        if [[ -z "$tiktok_region" || "$tiktok_region" == "null" ]]; then
-            tiktok_region=$(echo "$tiktok_response" | grep -oP '(?<=region":")[A-Z]{2,5}' | head -1)
-        fi
-        if [[ -n "$tiktok_region" ]]; then
-            case "$tiktok_region" in
-                ALISG|AWS|AZURE|GCP|CLOUDFLARE|UNKNOWN)
-                    tiktok_region=""
-                    ;;
-            esac
-        fi
-        if [[ -n "$tiktok_region" && "$tiktok_region" != "null" && "$tiktok_region" != "undefined" ]]; then
-            if [[ "$tiktok_region" == "US" || "$tiktok_region" == "JP" || "$tiktok_region" == "HK" || "$tiktok_region" == "KR" ]]; then
-                tiktok_score=3
-                echo -e "   ${GREEN}✅ TikTok: 解锁 $tiktok_region 区${NC}"
-            else
-                tiktok_score=1
-                echo -e "   ${YELLOW}⚠️ TikTok: 解锁 $tiktok_region 区${NC}"
-            fi
-        else
-            tiktok_score=2
-            echo -e "   ${GREEN}✅ TikTok: 可访问 (区域未知)${NC}"
-        fi
-    else
-        tiktok_score=0
-        echo -e "   ${RED}❌ TikTok: 无法访问 (HTTP $tiktok_code)${NC}"
-    fi
-fi
-[[ -z "$tiktok_score" ]] && tiktok_score=0
-[[ -z "$tiktok_region" ]] && tiktok_region="无"
-
-echo -e "\n${YELLOW}🚦 [5/7] 三网回程路由（多节点检测）...${NC}"
-if ! command -v traceroute &> /dev/null; then
-    echo -e "   ${YELLOW}正在安装 traceroute...${NC}"
-    apt install traceroute -y >/dev/null 2>&1 || yum install traceroute -y >/dev/null 2>&1
-fi
-
-declare -A nodes=(
-    ["北京电信"]="219.141.140.10"
-    ["上海电信"]="202.96.209.133"
-    ["广州电信"]="61.144.56.100"
-    ["成都电信"]="61.139.2.69"
-    ["北京联通"]="202.106.195.68"
-    ["上海联通"]="210.22.97.1"
-    ["广州移动"]="120.196.165.24"
-    ["成都移动"]="211.137.96.205"
-)
-
-cn2gia_count=0; cn2gt_count=0; telecom_163=0; unicom_4837=0; mobile_cmi=0; detect_success=0; route_summary=()
-echo -e "   ${YELLOW}正在检测多节点回程路由（尝试多种模式）...${NC}"
-for node_name in "${!nodes[@]}"; do
-    target_ip="${nodes[$node_name]}"
-    route_output=""
-    # 模式1：TCP 模式（端口80）
-    route_output=$(timeout 8 traceroute -T -p 80 -m 15 "$target_ip" 2>/dev/null)
-    # 模式2：如果 TCP 失败，尝试 ICMP 模式
-    if [[ -z "$route_output" ]]; then
-        route_output=$(timeout 8 traceroute -I -m 15 "$target_ip" 2>/dev/null)
-    fi
-    # 模式3：如果 ICMP 也失败，尝试 UDP 模式（使用非特权端口）
-    if [[ -z "$route_output" ]]; then
-        route_output=$(timeout 8 traceroute -U -p 33434 -m 15 "$target_ip" 2>/dev/null)
-    fi
-    # 模式4：如果都失败，尝试用 mtr 检测（如果有）
-    if [[ -z "$route_output" ]] && command -v mtr &> /dev/null; then
-        route_output=$(timeout 8 mtr -r -c 3 -m 15 "$target_ip" 2>/dev/null)
-    fi
-    if [[ -n "$route_output" ]]; then
-        detect_success=$((detect_success + 1))
-        if echo "$route_output" | grep -qiE "59\.43|CTGNET|CN2"; then
-            if echo "$route_output" | grep -qiE "GIA"; then
-                cn2gia_count=$((cn2gia_count + 1)); route_summary+=("${node_name}: CN2 GIA ✅")
-            else
-                cn2gt_count=$((cn2gt_count + 1)); route_summary+=("${node_name}: CN2 GT ✅")
-            fi
-        elif echo "$route_output" | grep -qiE "AS4837|4837|chinaunicom|CNC"; then
-            unicom_4837=$((unicom_4837 + 1)); route_summary+=("${node_name}: 联通4837")
-        elif echo "$route_output" | grep -qiE "AS9808|9808|CMI|AS58453|chinamobile|CMCC"; then
-            mobile_cmi=$((mobile_cmi + 1)); route_summary+=("${node_name}: 移动CMI")
-        elif echo "$route_output" | grep -qiE "202\.97|163"; then
-            telecom_163=$((telecom_163 + 1)); route_summary+=("${node_name}: 电信163")
-        else
-            route_summary+=("${node_name}: 普通线路")
-        fi
-    else
-        route_summary+=("${node_name}: 检测超时")
-    fi
-done
-
-echo -e "   ${GREEN}检测结果摘要:${NC}"
-for ((i=0; i<${#route_summary[@]} && i<6; i++)); do
-    echo -e "     ${route_summary[$i]}"
-done
-if [[ ${#route_summary[@]} -gt 6 ]]; then
-    echo -e "     ... 共 ${#route_summary[@]} 个节点"
-fi
-
-# 评分逻辑
-if [[ $detect_success -eq 0 ]]; then
-    route_score=5; route_desc="所有节点检测失败"
-elif [[ $cn2gia_count -gt 0 ]]; then
-    route_score=10; route_desc="CN2 GIA直连（${cn2gia_count}个节点）"
-elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $unicom_4837 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
-    route_score=9; route_desc="纯CN2 GT直连（${cn2gt_count}个节点）"
-elif [[ $cn2gt_count -gt 0 ]] && [[ $telecom_163 -gt 0 ]]; then
-    route_score=7; route_desc="混合线路（CN2 GT + 电信163）"
-elif [[ $cn2gt_count -gt 0 ]] && [[ $unicom_4837 -gt 0 ]]; then
-    route_score=7; route_desc="混合线路（CN2 GT + 联通4837）"
-elif [[ $cn2gt_count -gt 0 ]] && [[ $mobile_cmi -gt 0 ]]; then
-    route_score=7; route_desc="混合线路（CN2 GT + 移动CMI）"
-elif [[ $telecom_163 -gt 0 ]] && [[ $unicom_4837 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
-    route_score=6; route_desc="电信163普通线路"
-elif [[ $unicom_4837 -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $mobile_cmi -eq 0 ]]; then
-    route_score=6; route_desc="联通4837普通线路"
-elif [[ $mobile_cmi -gt 0 ]] && [[ $telecom_163 -eq 0 ]] && [[ $unicom_4837 -eq 0 ]]; then
-    route_score=6; route_desc="移动CMI普通线路"
-else
-    route_score=5; route_desc="多运营商混合线路"
-fi
-echo -e "   回程综合评分: ${route_score}/10 (${route_desc})"
-
-echo -e "\n${YELLOW}📶 [6/7] 网络连通与带宽...${NC}"
-baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.baidu.com 2>/dev/null)
-[[ "$baidu_code" == "200" ]] && { tcp_score=10; tcp_desc="百度通"; } || { tcp_score=3; tcp_desc="百度不通"; }
-echo -e "   TCP连通: $tcp_desc -> ${tcp_score}/10"
-
-speed_score=3
-speed_desc="测速失败"
-upload_mbps=0
-
-# ==================== 安装 speedtest-cli ====================
-if ! command -v speedtest-cli &> /dev/null; then
-    echo -e "   ${YELLOW}正在安装 speedtest-cli（约10秒）...${NC}"
-    apt install speedtest-cli -y >/dev/null 2>&1 || yum install speedtest-cli -y >/dev/null 2>&1
-    if ! command -v speedtest-cli &> /dev/null; then
-        apt install python3-pip -y >/dev/null 2>&1
-        pip3 install speedtest-cli -q >/dev/null 2>&1
-    fi
-fi
-
-# ==================== speedtest-cli 三次测速取最大值 ====================
-if command -v speedtest-cli &> /dev/null; then
-    echo -e "   ${YELLOW}正在测速（共3次，取最大值，每次约60秒）...${NC}"
-    max_upload=0
-    success_count=0
-    
-    for i in {1..3}; do
-        st_result=$(timeout 90 speedtest-cli --simple 2>&1)
-        
-        if [[ -n "$st_result" ]]; then
-            upload_raw=$(echo "$st_result" | grep -i "Upload" | sed -E 's/.*Upload:?\s*([0-9.]+).*/\1/')
-            if [[ -n "$upload_raw" && "$upload_raw" != "0" ]]; then
-                upload_mbps_tmp=$(printf "%.1f" "$upload_raw" 2>/dev/null)
-                if [[ -n "$upload_mbps_tmp" && "$upload_mbps_tmp" != "0.0" ]]; then
-                    success_count=$((success_count + 1))
-                    if (( $(echo "$upload_mbps_tmp > $max_upload" | bc -l 2>/dev/null) )); then
-                        max_upload=$upload_mbps_tmp
-                    fi
-                    echo -e "   第 ${i}/3 次: ${upload_mbps_tmp} Mbps"
-                else
-                    echo -e "   第 ${i}/3 次: 失败 (无效数值)"
-                fi
-            else
-                echo -e "   第 ${i}/3 次: 失败 (无法提取速度)"
-            fi
-        else
-            echo -e "   第 ${i}/3 次: 失败 (无输出)"
-        fi
-        sleep 1
-    done
-    
-    if [[ -n "$max_upload" && "$max_upload" != "0" ]]; then
-        upload_mbps=$max_upload
-        speed_desc="下载速度(最大 ${upload_mbps}Mbps)"
-        echo -e "   ${GREEN}✅ 有效测速 ${success_count}/3 次，取最大值: ${upload_mbps} Mbps${NC}"
-    else
-        echo -e "   ${YELLOW}⚠️ 所有测速均失败，带宽得分给基础分${NC}"
-        upload_mbps=0
-        speed_desc="测速全部失败"
-    fi
-else
-    echo -e "   ${YELLOW}⚠️ speedtest-cli 安装失败，跳过测速${NC}"
-    upload_mbps=0
-    speed_desc="测速失败"
-fi
-
-# 带宽评分
-if [[ -n "$upload_mbps" && "$upload_mbps" != "0" ]]; then
-    if (( $(echo "$upload_mbps >= 80" | bc -l) )); then speed_score=10
-    elif (( $(echo "$upload_mbps >= 50" | bc -l) )); then speed_score=9
-    elif (( $(echo "$upload_mbps >= 30" | bc -l) )); then speed_score=8
-    elif (( $(echo "$upload_mbps >= 15" | bc -l) )); then speed_score=7
-    elif (( $(echo "$upload_mbps >= 8" | bc -l) )); then speed_score=5
-    elif (( $(echo "$upload_mbps >= 3" | bc -l) )); then speed_score=4
-    else speed_score=3
-    fi
-else
-    speed_score=3
-fi
-echo -e "   带宽: $speed_desc -> ${speed_score}/10"
-
-# 网络质量权重：TCP连通30%，延迟35%，带宽35%
-score_net=$(echo "scale=1; $tcp_score * 0.30 + $lat_score * 0.35 + $speed_score * 0.35" | bc)
-
-echo -e "\n${YELLOW}📺 [7/7] 流媒体解锁...${NC}"
-BrowserUA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-stream_score=0
-declare -a stream_results
-
-echo -e "   ${YELLOW}检测 Netflix...${NC}"
-result1=$(curl --user-agent "${BrowserUA}" -fsL --write-out %{http_code} --output /dev/null --max-time 10 "https://www.netflix.com/title/81280792" 2>&1)
-if [[ "$result1" == "404" ]]; then
-    stream_results+=("Netflix: Originals Only"); stream_score=$((stream_score + 2))
-elif [[ "$result1" == "403" ]]; then
-    stream_results+=("Netflix: ❌ 不可用")
-elif [[ "$result1" == "200" ]]; then
-    region=$(curl --user-agent "${BrowserUA}" -fsL --max-time 10 --write-out %{redirect_url} --output /dev/null "https://www.netflix.com/title/80018499" | cut -d '/' -f4 | cut -d '-' -f1)
-    [[ -z "$region" ]] && region="US"
-    stream_results+=("Netflix: ✅ 解锁 (区域: ${region})"); stream_score=$((stream_score + 4))
-else
-    stream_results+=("Netflix: ⚠️ 连接失败")
-fi
-
-echo -e "   ${YELLOW}检测 YouTube Premium...${NC}"
-tmpresult=$(curl --max-time 10 -sS -H "Accept-Language: en" "https://www.youtube.com/premium" 2>&1)
-region=$(curl --user-agent "${BrowserUA}" -sL --max-time 10 "https://www.youtube.com/premium" | grep "countryCode" | sed 's/.*"countryCode"//' | cut -f2 -d'"')
-if [ -z "$region" ]; then
-    isCN=$(echo "$tmpresult" | grep 'www.google.cn')
-    if [ -n "$isCN" ]; then region="CN"; else region="US"; fi
-fi
-if echo "$tmpresult" | grep -q "Premium is not available in your country"; then
-    stream_results+=("YouTube Premium: ❌ 不可用 (区域: ${region})")
-elif echo "$tmpresult" | grep -q "YouTube and YouTube Music ad-free"; then
-    stream_results+=("YouTube Premium: ✅ 可用 (区域: ${region})"); stream_score=$((stream_score + 3))
-else
-    stream_results+=("YouTube Premium: ⚠️ 检测失败")
-fi
-
-echo -e "   ${YELLOW}检测 Bilibili...${NC}"
-bilibili_status=""
-randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
-result=$(curl --user-agent "${BrowserUA}" -fsL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=82846771&qn=0&type=&otype=json&ep_id=307247&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
-if [[ "$result" != "curl"* ]]; then
-    code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
-    if [ "$code" = "0" ]; then bilibili_status="大陆限定"; fi
-fi
-if [ -z "$bilibili_status" ]; then
-    randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
-    result=$(curl --user-agent "${BrowserUA}" -fsL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
-    if [[ "$result" != "curl"* ]]; then
-        code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
-        if [ "$code" = "0" ]; then bilibili_status="港澳台限定"; fi
-    fi
-fi
-if [ -z "$bilibili_status" ]; then
-    randsession="$(cat /dev/urandom | head -n 32 | md5sum | head -c 32)"
-    result=$(curl --user-agent "${BrowserUA}" -fsL --max-time 10 "https://api.bilibili.com/pgc/player/web/playurl?avid=50762638&cid=100279344&qn=0&type=&otype=json&ep_id=268176&fourk=1&fnver=0&fnval=16&session=${randsession}&module=bangumi" 2>&1)
-    if [[ "$result" != "curl"* ]]; then
-        code=$(echo "$result" | grep '"code"' | awk -F 'code":' '{print $2}' | awk -F ',' '{print $1}')
-        if [ "$code" = "0" ]; then bilibili_status="台湾限定"; fi
-    fi
-fi
-if [ -n "$bilibili_status" ]; then
-    stream_results+=("Bilibili: ✅ 解锁 (${bilibili_status})"); stream_score=$((stream_score + 2))
-else
-    stream_results+=("Bilibili: ❌ 不可用")
-fi
-
-echo -e "   ${YELLOW}检测 iQIYI...${NC}"
-curl --user-agent "${BrowserUA}" -s -I --max-time 10 "https://www.iq.com/" > /tmp/iqiyi 2>/dev/null
-if [ $? -eq 0 ]; then
-    iqiyi_region=$(cat /tmp/iqiyi | grep 'mod=' | awk '{print $2}' | cut -f2 -d'=' | cut -f1 -d';')
-    rm -f /tmp/iqiyi
-    if [ -n "$iqiyi_region" ]; then
-        if [[ "$iqiyi_region" == "ntw" ]]; then iqiyi_region="TW"; else iqiyi_region=$(echo "$iqiyi_region" | tr '[:lower:]' '[:upper:]'); fi
-        stream_results+=("iQIYI: ✅ 解锁 (区域: ${iqiyi_region})"); stream_score=$((stream_score + 1))
-    else
-        stream_results+=("iQIYI: ⚠️ 检测失败")
-    fi
-else
-    stream_results+=("iQIYI: ⚠️ 连接失败")
-fi
-
-echo -e "   ${YELLOW}检测 ChatGPT...${NC}"
-if [[ $(curl --max-time 10 -sS https://chat.openai.com/ -I 2>/dev/null | grep "text/plain") != "" ]]; then
-    stream_results+=("ChatGPT: ❌ IP 被屏蔽")
-else
-    countryCode=$(curl --max-time 10 -sS https://chat.openai.com/cdn-cgi/trace 2>/dev/null | grep "loc=" | awk -F= '{print $2}')
-    if [ -n "$countryCode" ]; then
-        stream_results+=("ChatGPT: ✅ 可用 (区域: ${countryCode})"); stream_score=$((stream_score + 2))
-    else
-        stream_results+=("ChatGPT: ⚠️ 检测失败")
-    fi
-fi
-
-echo -e "   ${GREEN}流媒体解锁结果:${NC}"
-for result in "${stream_results[@]}"; do
-    echo -e "     $result"
-done
-if [[ $stream_score -ge 8 ]]; then score_stream=10; stream_desc="流媒体全解锁"
-elif [[ $stream_score -ge 5 ]]; then score_stream=7; stream_desc="部分解锁"
-elif [[ $stream_score -ge 2 ]]; then score_stream=4; stream_desc="少量解锁"
-else score_stream=1; stream_desc="基本不解锁"; fi
-echo -e "   流媒体综合得分: ${score_stream}/10 ($stream_desc)"
-
-# 确保所有硬件变量都有值
-[[ -z "$cpu_score" ]] && cpu_score=0
-[[ -z "$disk_score" ]] && disk_score=0
-[[ -z "$mem_score" ]] && mem_score=1
-
-hw_score=$(awk "BEGIN {printf \"%.1f\", ($cpu_score + $disk_score + $mem_score) / 3}")
-
-# TikTok 附加分
-tiktok_bonus=0
-if [[ "$tiktok_score" -gt 0 ]]; then
-    tiktok_bonus=0.1
-    if [[ -n "$tiktok_region" && "$tiktok_region" != "无" && "$tiktok_region" == "$country_code" ]]; then
-        tiktok_bonus=0.2
-    fi
-fi
-
-total=$(awk "BEGIN {printf \"%.2f\", \
-    (${hw_score})*0.35 + \
-    (${score_net})*0.30 + \
-    (${route_score})*0.15 + \
-    (${score_ip})*0.12 + \
-    (${score_stream})*0.08 + \
-    ${tiktok_bonus}}")
-[[ -z "$total" || "$total" == "0" ]] && total=5.0
-final=$(printf "%.1f" "$total")
-
-echo -e "\n${BLUE}=========================================${NC}"
-echo -e "${BLUE}         🏆 最终体检报告 (v5.11)      ${NC}"
-echo -e "${BLUE}=========================================${NC}"
-echo -e "硬件性能 (35%) : ${hw_score}/10  (CPU:$cpu_score 磁盘:$disk_score 内存:$mem_score)"
-echo -e "  └─ CPU: $cpu_score/10  [$GREEN$(show_score_standard $cpu_score cpu)${NC}]"
-echo -e "  └─ 磁盘: $disk_score/10  [$GREEN$(show_score_standard $disk_score disk)${NC}]"
-echo -e "  └─ 内存: $mem_score/10  [$GREEN$(show_score_standard $mem_score memory)${NC}]"
-echo -e "网络质量 (30%) : ${score_net}/10  (延迟:${lat_int}ms | 带宽:$speed_desc)"
-echo -e "  └─ 延迟: ${lat_score}/10  [$GREEN$(show_score_standard $lat_score network)${NC}]"
-echo -e "  └─ 带宽: ${speed_score}/10  [$GREEN$(show_score_standard $speed_score network)${NC}]"
-echo -e "IP体质   (12%) : ${score_ip}/10  (${region} | ${ip_type})"
-echo -e "  └─ $GREEN$(show_score_standard $score_ip ip)${NC}"
-echo -e "流媒体   (8%)  : ${score_stream}/10"
-echo -e "  └─ $GREEN$(show_score_standard $score_stream stream)${NC}"
-echo -e "回程直连 (15%) : ${route_score}/10"
-echo -e "  └─ $GREEN$(show_score_standard $route_score route)${NC}"
-echo -e "TikTok   (附加) : +${tiktok_bonus}分 (${tiktok_region:-无})"
-echo -e "-----------------------------------------"
-
-if (( $(echo "$final >= 8.5" | bc -l) )); then
-    echo -e "${GREEN}【总分】: ${final} / 10.0  🏆 S级 (神机)${NC}"
-elif (( $(echo "$final >= 7.0" | bc -l) )); then
-    echo -e "${GREEN}【总分】: ${final} / 10.0  ✅ A级 (优秀)${NC}"
-elif (( $(echo "$final >= 5.5" | bc -l) )); then
-    echo -e "${YELLOW}【总分】: ${final} / 10.0  ⚠️ B级 (及格)${NC}"
-else
-    echo -e "${RED}【总分】: ${final} / 10.0  ❌ C/D级${NC}"
-fi
-
-# 生成综合评语
-echo -e "\n${YELLOW}📋 综合评语${NC}"
-generate_comment "$cpu_score" "$disk_score" "$mem_score" "$score_net" "$score_ip" "$route_score" "$score_stream" "$final" "$region" "$ip_type"
-
-echo -e "${BLUE}=========================================${NC}"
+miss=0
+for k in "${!SCORE[@]}"; do [[ -z "${SCORE[$k]}" ]] && miss=$((miss+1)); done
+(( miss > 0 )) && echo "  ${Y}${miss} 项未测到，已按权重剔除而非估算；分数存在覆盖偏差。${N}"
+echo "  ${D}注：流媒体/解锁只代表用途适配，不代表机器质量；线路项为去程，回程需国内探针另测。${N}"
