@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# vpscheck v6.5 — 场景化 VPS 评测
-# VPSCHECK_BUILD=20261125-0900
+# vpscheck v6.6 — 场景化 VPS 评测
+# VPSCHECK_BUILD=20261125-1000
 #
 # 设计原则：
 #   1. 不把「硬件质量」和「用途适配」混成一个分数，按场景分别出分
@@ -24,7 +24,7 @@ for arg in "$@"; do
     --quick) QUICK=1 ;;
     --install-deps) INSTALL=1 ;;
     --version)
-      echo "vpscheck v6.5 (build 20261125-0900)"
+      echo "vpscheck v6.6 (build 20261125-1000)"
       exit 0 ;;
     -h|--help)
       echo "用法: bash $0 [--quick] [--install-deps] [--version]"
@@ -173,8 +173,8 @@ NAME[ports]="出站端口"
 
 MODE_NAME="完整模式"; (( QUICK )) && MODE_NAME="快速模式"
 echo "${B}=========================================${N}"
-echo "${B} VPS 评测 v6.5 — 场景化评分 (${MODE_NAME})${N}"
-echo "${D} 构建标记: 20261125-0900${N}"
+echo "${B} VPS 评测 v6.6 — 场景化评分 (${MODE_NAME})${N}"
+echo "${D} 构建标记: 20261125-1000${N}"
 echo "${B} 测不到 → N/A，不估算；一次跑完，按场景分别出分${N}"
 echo "${B}=========================================${N}"
 
@@ -440,8 +440,10 @@ fi
 # ---------------------------------------------------------------- 6. 带宽
 # 原则：不用单一 Ookla；不用会被对等互联虚高的 Cloudflare；实测取"各端点中位的较低者"，
 #       因为套餐限速是硬上限，虚高只来自个别 CDN 对等互联，较低者更接近真实出口。
+#       关键：失效端点（返回 ~0 Mbps）必须先剔除再取低，否则一个坏端点毁掉全部评分。
 #       已知套餐带宽时用 BW_MBPS 直接指定，实测仅作对照。
-echo -e "\n${Y}[6/8] 带宽 (双端点实测取低；BW_MBPS 可指定套餐值)${N}"
+BW_MIN=0.5   # 低于此速率(Mbps)视为端点失效，不参与评分
+echo -e "\n${Y}[6/8] 带宽 (有效端点取低；BW_MBPS 可指定套餐值)${N}"
 # BW_MBPS 无需测速，快速模式下也直接采用
 if [[ -n "$BW_MBPS" ]] && awk -v x="$BW_MBPS" 'BEGIN{exit !((x+0)>0)}'; then
   bs=$(tier_score "$BW_MBPS" "200:10 100:9 50:8 30:7 15:5 5:3")
@@ -454,36 +456,44 @@ else
     "OVH|https://proof.ovh.net/files/100Mb.dat"
     "Cachefly|https://cachefly.cachefly.net/10mb.test"
   )
-  endpoint_med=(); labs=()
+  endpoint_med=(); labs=(); dead=()
   for item in "${bw_urls[@]}"; do
     lab=${item%%|*}; url=${item#*|}
     evals=()
     for i in 1 2 3; do
       sp=$(timeout 25 curl -sL -o /dev/null --max-time 22 -w '%{speed_download}' "$url" 2>/dev/null)
-      if [[ -n "$sp" ]] && awk -v x="$sp" 'BEGIN{exit !(x>0)}'; then
+      if [[ -n "$sp" ]] && awk -v x="$sp" -v m="$BW_MIN" 'BEGIN{exit !((x*8/1000000)>=m)}'; then
         mbps=$(awk -v x="$sp" 'BEGIN{printf "%.2f", x*8/1000000}')
         evals+=("$mbps")
       fi
     done
     if (( ${#evals[@]} )); then
       em=$(median "${evals[@]}")
-      endpoint_med+=("$em"); labs+=("${lab}:${em}")
-      echo "  ${lab}: ${em} Mbps (${#evals[@]}/3 次，中位)"
+      # 端点中位仍低于下限 → 整个端点失效，剔除
+      if awk -v x="$em" -v m="$BW_MIN" 'BEGIN{exit !(x<m)}'; then
+        dead+=("${lab}:${em}(过低)")
+        echo "  ${lab}: ${em} Mbps -> 疑似不可达，已剔除"
+      else
+        endpoint_med+=("$em"); labs+=("${lab}:${em}")
+        echo "  ${lab}: ${em} Mbps (${#evals[@]}/3 次有效，中位)"
+      fi
     else
-      echo "  ${lab}: 失败"
+      dead+=("${lab}:无有效采样")
+      echo "  ${lab}: 失败，已剔除"
     fi
   done
 
   if (( ${#endpoint_med[@]} )); then
-    # 取各端点中位数的较低者，规避单端点对等互联虚高
+    # 只在有效端点中取低者，规避单端点对等互联虚高
     bw=$(printf '%s\n' "${endpoint_med[@]}" | sort -n | head -1)
     bs=$(tier_score "$bw" "200:10 100:9 50:8 30:7 15:5 5:3")
-    note="$(IFS=' '; echo "${labs[*]}")；各端点中位取低者，规避 CDN 虚高"
-    if (( ${#endpoint_med[@]} == 1 )); then note+="；仅1个端点可用，参考性下降"; fi
-    record net_bw "$bs" "${bw} Mbps (端点中位取低)" "$note"
-    echo "  采用: ${bw} Mbps (端点中位取低) -> ${bs}/10"
+    note="$(IFS=' '; echo "${labs[*]}")；有效端点取低者"
+    if (( ${#dead[@]} )); then note+="；已剔除失效端点($(IFS=,; echo "${dead[*]}"))"; fi
+    if (( ${#endpoint_med[@]} == 1 )); then note+="；仅1个有效端点，参考性下降"; fi
+    record net_bw "$bs" "${bw} Mbps (有效端点取低)" "$note"
+    echo "  采用: ${bw} Mbps (${#endpoint_med[@]} 个有效端点取低) -> ${bs}/10"
   else
-    skip net_bw "全部目标失败" "不给默认分；可用 BW_MBPS=30 直接指定"
+    skip net_bw "全部端点失效" "不给默认分；可用 BW_MBPS=30 直接指定"
   fi
 fi
 
