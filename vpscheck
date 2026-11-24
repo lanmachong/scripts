@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# vpscheck v6.0 — 场景化 VPS 评测
+# vpscheck v6.3 — 场景化 VPS 评测
+# VPSCHECK_BUILD=20261125-0701
 #
 # 设计原则：
 #   1. 不把「硬件质量」和「用途适配」混成一个分数，按场景分别出分
@@ -7,9 +8,10 @@
 #   3. 关键指标取中位数/多次采样，不取最大值，不拿单次瞬时值定生死
 #   4. 只报告能测的东西；去程就是去程，不冒充回程；原生/广播只作信息不作加分
 #
-# 用法: bash vpscheck.sh [--quick] [--install-deps]
+# 用法: bash vpscheck [--quick] [--install-deps] [--version]
 #   --quick         跳过测速和路由探测，缩短到约 30 秒
-#   --install-deps  由脚本尝试安装缺失的依赖（默认只提示，不擅自安装）
+#   --install-deps  由脚本尝试安装缺失的依赖（默认先询问）
+#   --version       只打印版本，立刻退出，用来确认线上文件是否更新
 
 set -uo pipefail
 
@@ -19,8 +21,11 @@ for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=1 ;;
     --install-deps) INSTALL=1 ;;
+    --version)
+      echo "vpscheck v6.3 (build 20261125-0701)"
+      exit 0 ;;
     -h|--help)
-      echo "用法: bash $0 [--quick] [--install-deps]"
+      echo "用法: bash $0 [--quick] [--install-deps] [--version]"
       echo "启动时会询问是否安装缺失工具；--install-deps 表示不再询问直接装"
       exit 0 ;;
     *) echo "未知参数: $arg"; exit 1 ;;
@@ -60,19 +65,34 @@ install_pkg() {
     return 1
   fi
   if need apt-get; then
-    (( APT_UPDATED )) || { apt-get update -qq >/dev/null 2>&1; APT_UPDATED=1; }
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1
+    (( APT_UPDATED )) || { apt-get update -qq </dev/null >/dev/null 2>&1; APT_UPDATED=1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" </dev/null >/dev/null 2>&1
   elif need yum; then
-    yum install -y "$pkg" >/dev/null 2>&1
+    yum install -y "$pkg" </dev/null >/dev/null 2>&1
   elif need dnf; then
-    dnf install -y "$pkg" >/dev/null 2>&1
+    dnf install -y "$pkg" </dev/null >/dev/null 2>&1
   fi
   if need "$cmd"; then return 0; fi
   echo "  ${R}安装失败：$pkg${N}"
   return 1
 }
 
-# 开跑前先问要不要装缺失工具；非交互环境直接跳过
+# 从终端读答案，而不是从 stdin：
+# 用户用 curl ... | bash 运行时 stdin 是脚本本身，普通 read 会读不到或吃掉脚本
+ask_user() {
+  local prompt=$1 ans=""
+  if [[ -e /dev/tty ]]; then
+    printf '%s' "$prompt" 2>/dev/null >/dev/tty || return 1
+    IFS= read -r ans 2>/dev/null </dev/tty || { printf '\n' 2>/dev/null >/dev/tty; return 1; }
+    ANSWER="$ans"
+    return 0
+  fi
+  [[ -t 0 ]] || return 1
+  read -r -p "$prompt" ans || return 1
+  ANSWER="$ans"
+}
+
+# 开跑前先问要不要装缺失工具；真没终端（定时任务等）才跳过
 preflight() {
   local -a pairs=("sysbench:sysbench" "fio:fio")
   (( QUICK )) || pairs+=("traceroute:traceroute" "speedtest-cli:speedtest-cli")
@@ -86,10 +106,10 @@ preflight() {
   echo "  ${Y}缺少工具：${miss_pkg[*]}${N}"
   if (( INSTALL )); then
     answer="y"
-  elif [[ -t 0 ]]; then
-    read -r -p "  现在安装？需要 root 权限。[Y/n] " answer
+  elif ask_user "  是否现在自动安装？需要 root 权限。直接回车=安装，输入 n=跳过 [Y/n] "; then
+    answer="$ANSWER"
   else
-    echo "  ${D}非交互运行，跳过安装；可加 --install-deps 强制安装${N}"
+    echo "  ${D}没有可用终端，跳过安装；可加 --install-deps 强制安装${N}"
     return 0
   fi
   case "$answer" in
@@ -148,7 +168,8 @@ NAME[ports]="出站端口"
 
 MODE_NAME="完整模式"; (( QUICK )) && MODE_NAME="快速模式"
 echo "${B}=========================================${N}"
-echo "${B} VPS 评测 v6.0 — 场景化评分 (${MODE_NAME})${N}"
+echo "${B} VPS 评测 v6.3 — 场景化评分 (${MODE_NAME})${N}"
+echo "${D} 构建标记: 20261125-0701${N}"
 echo "${B} 测不到 → N/A，不估算；一次跑完，按场景分别出分${N}"
 echo "${B}=========================================${N}"
 
