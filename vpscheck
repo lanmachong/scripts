@@ -67,13 +67,21 @@ install_pkg() {
 ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 >= b+0)}'; }
 le() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 <= b+0)}'; }
 avg() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f",(a+b)/2}'; }
-# tier_score <value> "阈值:分数 阈值:分数 ..."  从高到低匹配
+# tier_score <value> "阈值:分数 阈值:分数 ..."  从高到低匹配，越大越好
 tier_score() {
-  local v=$1; shift
-  local pair t s
-  for pair in "$@"; do
+  local v=$1 all="${*:2}" pair t s
+  for pair in $all; do
     t=${pair%%:*}; s=${pair##*:}
     ge "$v" "$t" && { echo "$s"; return; }
+  done
+  echo 2
+}
+# 越小越好：steal / 延迟 / 丢包
+tier_score_low() {
+  local v=$1 all="${*:2}" pair t s
+  for pair in $all; do
+    t=${pair%%:*}; s=${pair##*:}
+    le "$v" "$t" && { echo "$s"; return; }
   done
   echo 2
 }
@@ -120,7 +128,7 @@ if [[ -r /proc/stat ]]; then
   fi
 fi
 if [[ "$steal_mode" == "ok" ]]; then
-  ss=$(tier_score "$steal_val" "1:10 3:8 6:6 10:4")
+  ss=$(tier_score_low "$steal_val" "1:10 3:8 6:6 10:4")
   record steal "$ss" "${steal_val}% (1s采样峰值)" "steal 越低越好；>5% 通常意味着明显超售"
   echo "  steal: ${steal_val}% -> ${ss}/10"
 else
@@ -212,10 +220,11 @@ if install_pkg fio fio; then
   bw=$(echo "$bw_line" | grep -oE 'BW=[0-9.]+' | head -1 | cut -d= -f2)
   bw_unit=$(echo "$bw_line" | grep -oE '[MG]iB/s' | head -1)
   if [[ -n "$bw" ]]; then
-    [[ "$bw_unit" == "MiB/s" ]] && bw=$(awk -v x="$bw" 'BEGIN{printf "%.0f",x/1024}')
+    # 统一换算成 MB/s，别先转 GiB 再四舍五入，否则 512MiB/s 会变成 0
+    [[ "$bw_unit" == "GiB/s" ]] && bw=$(awk -v x="$bw" 'BEGIN{printf "%.0f",x*1024}')
     ss=$(tier_score "$bw" "1000:10 500:9 200:8 100:6 50:4")
-    record disk_seq "$ss" "${bw} GiB/s (${bw_unit})" "1M 顺序读"
-    echo "  顺序读: ${bw} ${bw_unit} -> ${ss}/10"
+    record disk_seq "$ss" "${bw} MB/s" "1M 顺序读"
+    echo "  顺序读: ${bw} MB/s -> ${ss}/10"
   else
     skip disk_seq "无数据" "顺序读测试失败"
   fi
@@ -245,7 +254,7 @@ ms=$(tier_score "$avail_mb" "15000:10 8000:9 4000:8 2000:6 1000:4")
 note="MemAvailable，已考虑 cgroup 限制"
 if (( swap_total > 0 )); then
   swap_used=$(( (swap_total - swap_free) * 100 / swap_total ))
-  if (( swap_used > 20 )); then ms=$(( ms > 2 ? ms-2 : 1 )); note+="；swap 已用 ${swap_used}%，扣分"; fi
+  if (( swap_used > 20 )); then ms=$(( ms > 2 ? ms-1 : 1 )); note+="；swap 已用 ${swap_used}%，扣1分"; fi
 fi
 record mem "$ms" "${avail_mb} MB 可用 / 总 $(awk -v x="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)" 'BEGIN{printf "%.0f",x/1024}') MB" "$note"
 echo "  可用内存: ${avail_mb} MB -> ${ms}/10"
@@ -253,15 +262,17 @@ echo "  可用内存: ${avail_mb} MB -> ${ms}/10"
 # ---------------------------------------------------------------- 4. 网络延迟与丢包
 echo -e "\n${Y}[4/8] 网络延迟与丢包 (多节点，5包取中位)${N}"
 targets=("114.114.114.114" "223.5.5.5" "119.29.29.29" "219.141.140.10" "202.106.195.68" "120.196.165.24")
-rtts=(); losses=(); ok=0
+rtts=(); losses=(); ok=0; dead=0
 for ip in "${targets[@]}"; do
   po=$(timeout 8 ping -n -q -c 5 -i 0.2 -W 1 "$ip" 2>/dev/null)
   loss=$(echo "$po" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p')
   rtt=$(echo "$po"  | sed -n 's#.* = \([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\) ms#\2#p')
-  [[ -z "$loss" ]] && loss=100
-  losses+=("$loss")
-  if [[ -n "$rtt" ]]; then rtts+=("$rtt"); ok=$((ok+1)); fi
-  echo "  ${ip}: ${rtt:-超时} ms / 丢包 ${loss}%"
+  if [[ -n "$rtt" ]]; then
+    rtts+=("$rtt"); losses+=("${loss:-0}"); ok=$((ok+1))
+  else
+    dead=$((dead+1))
+  fi
+  echo "  ${ip}: ${rtt:-超时} ms / 丢包 ${loss:-?}%"
 done
 if (( ok == 0 )); then
   skip net_latency "全部超时" "ICMP 被完全丢弃或网络不通，按规则不估算延迟"
@@ -269,10 +280,10 @@ if (( ok == 0 )); then
 else
   med=$(printf '%s\n' "${rtts[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
   ls=$(awk -v n="${#losses[@]}" 'BEGIN{s=0} {s+=$1} END{printf "%.1f",s/n}' <<<"$(printf '%s\n' "${losses[@]}")")
-  lscore=$(tier_score "$med" "50:10 100:9 150:8 250:6 400:4")
-  loss_score=$(tier_score "$ls" "0.1:10 1:9 3:7 5:5 10:3")
+  lscore=$(tier_score_low "$med" "50:10 100:9 150:8 250:6 400:4")
+  loss_score=$(tier_score_low "$ls" "0.1:10 1:9 3:7 5:5 10:3")
   record net_latency "$lscore" "${med} ms (中位)" "到国内常用节点，非本地运营商专线口径"
-  record net_loss "$loss_score" "${ls}% 平均丢包" "6节点×5包，含失败节点计 100%"
+  record net_loss "$loss_score" "${ls}% 平均丢包 (${dead}/${#targets[@]} 节点无 ICMP 响应)" "只对有响应的节点算丢包；无响应多为 ICMP 过滤，不等于业务丢包"
   echo "  延迟中位: ${med} ms -> ${lscore}/10 | 平均丢包 ${ls}% -> ${loss_score}/10"
 fi
 
