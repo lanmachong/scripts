@@ -136,6 +136,7 @@ NAME[cpu_multi]="CPU多核扩展"
 NAME[steal]="超售/抢占"
 NAME[disk_rand]="磁盘随机IO"
 NAME[disk_seq]="磁盘顺序吞吐"
+NAME[disk_cap]="磁盘容量"
 NAME[mem]="可用内存"
 NAME[net_latency]="网络延迟"
 NAME[net_loss]="网络丢包"
@@ -162,19 +163,25 @@ echo "  型号: ${cpu_model:-未知} | 逻辑核: $cores"
 
 steal_mode="unknown"; steal_val=""
 if [[ -r /proc/stat ]]; then
-  read -r t1 s1 < <(awk '/^cpu /{t=0; for(i=2;i<=NF;i++)t+=$i; print t, ($9==""?"-1":$9)}' /proc/stat)
-  sleep 1
-  read -r t2 s2 < <(awk '/^cpu /{t=0; for(i=2;i<=NF;i++)t+=$i; print t, ($9==""?"-1":$9)}' /proc/stat)
-  if [[ "$s1" != "-1" && "$s2" != "-1" ]]; then
+  prev_t=""; prev_s=""; samples=()
+  for ((i=1; i<=5; i++)); do
+    read -r ct cs < <(awk '/^cpu /{t=0; for(j=2;j<=NF;j++)t+=$j; print t, ($9==""?"-1":$9)}' /proc/stat)
+    if [[ -n "$prev_t" && "$cs" != "-1" && "$prev_s" != "-1" ]]; then
+      samples+=("$(awk -v a="$prev_s" -v b="$cs" -v ta="$prev_t" -v tb="$ct" \
+        'BEGIN{d=tb>ta?((b-a)/(tb-ta)*100):0; printf "%.2f",(d>0?d:0)}')")
+    fi
+    prev_t="$ct"; prev_s="$cs"
+    (( i < 5 )) && sleep 1
+  done
+  if (( ${#samples[@]} )); then
     steal_mode="ok"
-    # 取两段采样的较大值，避免瞬时低抢占掩盖问题
-    steal_val=$(awk -v a="$s1" -v b="$s2" -v ta="$t1" -v tb="$t2" \
-      'BEGIN{d1=ta>0?(a/ta*100):0; d2=tb>0?(b/tb*100):0; printf "%.2f",(d1>d2?d1:d2)}')
+    # 取 4 段 1 秒采样的峰值，避免瞬时低抢占掩盖问题
+    steal_val=$(printf '%s\n' "${samples[@]}" | sort -nr | head -1)
   fi
 fi
 if [[ "$steal_mode" == "ok" ]]; then
   ss=$(tier_score_low "$steal_val" "1:10 3:8 6:6 10:4")
-  record steal "$ss" "${steal_val}% (1s采样峰值)" "steal 越低越好；>5% 通常意味着明显超售"
+  record steal "$ss" "${steal_val}% (4次采样峰值)" "steal 越低越好；>5% 通常意味着明显超售"
   echo "  steal: ${steal_val}% -> ${ss}/10"
 else
   skip steal "不可读" "容器/内核未暴露 steal 字段，该项不计分"
@@ -224,6 +231,21 @@ echo -e "\n${Y}[2/8] 磁盘性能${N}"
 root_dev=$(df -P / 2>/dev/null | awk 'NR==2{print $1}')
 root_size=$(df -h / 2>/dev/null | awk 'NR==2{print $2}')
 echo "  根分区: ${root_dev:-未知} (${root_size:-未知})"
+cap_num=$(echo "$root_size" | grep -oE '[0-9.]+' | head -1)
+cap_unit=$(echo "$root_size" | grep -oE '[KMGT]i?B|[KMGT]' | head -1 | tr -d 'iB')
+if [[ -n "$cap_num" ]]; then
+  case "$cap_unit" in
+    T) cap_gb=$(awk -v x="$cap_num" 'BEGIN{printf "%.0f",x*1024}') ;;
+    M) cap_gb=$(awk -v x="$cap_num" 'BEGIN{printf "%.1f",x/1024}') ;;
+    K) cap_gb=$(awk -v x="$cap_num" 'BEGIN{printf "%.3f",x/1048576}') ;;
+    *) cap_gb=$cap_num ;;
+  esac
+  capscore=$(tier_score "$cap_gb" "500:10 200:9 100:8 50:7 20:5 10:3")
+  record disk_cap "$capscore" "${root_size} (约${cap_gb}GB)" "根分区容量；速度高不等于能存东西"
+  echo "  系统盘容量: ${root_size} -> ${capscore}/10"
+else
+  skip disk_cap "${root_size:-未知}" "无法解析容量"
+fi
 
 if install_pkg fio fio; then
   fio_iops() {
@@ -254,7 +276,7 @@ if install_pkg fio fio; then
       ge "$p99n" 50000 && penalty=2 || { ge "$p99n" 20000 && penalty=1; }
     fi
     ds=$(( base > penalty ? base-penalty : 1 ))
-    record disk_rand "$ds" "读${ior} / 写${iow} IOPS, p99≈${p99:-?}us" "4K 随机，direct=1；读写取较低值，高尾延迟扣分"
+    record disk_rand "$ds" "读${ior} / 写${iow} IOPS, p99≈${p99:-?}us" "4K 随机，direct=1；读写取较低值，高尾延迟扣分；根分区 ${root_size:-?}"
     echo "  4K随机: 读${ior} / 写${iow} IOPS -> ${ds}/10"
   else
     skip disk_rand "fio 无有效输出" "可能后端不支持 direct I/O；不改用缓存测法，避免虚高"
@@ -268,7 +290,7 @@ if install_pkg fio fio; then
     # 统一换算成 MB/s，别先转 GiB 再四舍五入，否则 512MiB/s 会变成 0
     [[ "$bw_unit" == "GiB/s" ]] && bw=$(awk -v x="$bw" 'BEGIN{printf "%.0f",x*1024}')
     ss=$(tier_score "$bw" "1000:10 500:9 200:8 100:6 50:4")
-    record disk_seq "$ss" "${bw} MB/s" "1M 顺序读"
+    record disk_seq "$ss" "${bw} MB/s" "1M 顺序读；根分区 ${root_size:-?}（速度高不等于容量大）"
     echo "  顺序读: ${bw} MB/s -> ${ss}/10"
   else
     skip disk_seq "无数据" "顺序读测试失败"
@@ -409,15 +431,30 @@ cc=$(echo "$geo" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
 if [[ -n "$reg" && -n "$cc" ]]; then
   echo "  ${D}注册国=$reg / 定位国=$cc （差异只作参考，不计分：两家数据库更新不同步很常见）${N}"
 fi
+# 实际延迟远低于 IP 归属地应有水平 → 疑似广播 IP / 地理库误标，只提示不计分
+if [[ -n "${med:-}" && -n "$cc" ]]; then
+  case "$cc" in
+    CN|HK|TW|SG|JP|KR) : ;;
+    *)
+      if le "$med" 60; then
+        echo "  ${Y}提示：延迟 ${med}ms 与 IP 归属地 ${country:-$cc} 明显不符，疑似广播 IP 或地理库误标；实际位置以延迟为准，此项不计分。${N}"
+      fi
+      ;;
+  esac
+fi
 # DNSBL 反查，真实信誉信号
 if [[ -n "$ip" ]] && (need dig || need host || need getent); then
   rev=$(echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')
   if need dig; then ans=$(timeout 5 dig +short "${rev}.zen.spamhaus.org" 2>/dev/null)
   elif need host; then ans=$(timeout 5 host "${rev}.zen.spamhaus.org" 2>/dev/null | grep -oE '127\.0\.0\.[0-9]+' | head -1)
   else ans=$(timeout 5 getent hosts "${rev}.zen.spamhaus.org" 2>/dev/null | awk '{print $1}'); fi
-  if [[ -n "$ans" ]]; then
+  ans=$(echo "$ans" | head -1 | tr -d '\r')
+  if [[ "$ans" =~ ^127\.0\.0\.([2-9]|1[01])$ ]]; then
     record ip_rep 2 "命中 Spamhaus: ${ans}" "被主流反垃圾库标记，邮件/注册类业务风险高"
-    echo "  ${R}IP 信誉: 命中 Spamhaus${N}"
+    echo "  ${R}IP 信誉: 命中 Spamhaus (${ans})${N}"
+  elif [[ -n "$ans" ]]; then
+    skip ip_rep "查询异常: ${ans}" "非标准 Spamhaus 返回码，多为 DNS 通配符/NXDOMAIN 劫持，不计分"
+    echo "  ${Y}IP 信誉: 查询返回 ${ans}，判定为异常，跳过${N}"
   else
     record ip_rep 9 "Spamhaus 未命中" "仅代表未上反垃圾库，不等于平台不封"
     echo "  IP 信誉: Spamhaus 未命中"
@@ -461,12 +498,12 @@ echo "  出站端口: $(IFS=' '; echo "${plist[*]}")"
 # 每个场景权重之和 = 1.00；N/A 项权重自动从分母移除
 profiles() {
 cat <<'EOF'
-通用|cpu_single:0.12 cpu_multi:0.08 steal:0.12 disk_rand:0.12 disk_seq:0.06 mem:0.12 net_latency:0.10 net_loss:0.10 net_bw:0.10 ports:0.08
-建站|cpu_single:0.14 cpu_multi:0.06 steal:0.12 disk_rand:0.14 disk_seq:0.04 mem:0.16 net_latency:0.12 net_loss:0.10 net_bw:0.08 ports:0.04
-跨境代理|cpu_single:0.05 cpu_multi:0.03 steal:0.08 disk_rand:0.04 disk_seq:0.02 mem:0.06 net_latency:0.18 net_loss:0.18 net_bw:0.10 route_cn:0.12 ip_rep:0.10 media:0.04
-流媒体|cpu_single:0.05 cpu_multi:0.03 steal:0.06 disk_rand:0.03 disk_seq:0.02 mem:0.05 net_latency:0.10 net_loss:0.08 net_bw:0.10 ip_rep:0.20 media:0.28
-计算|cpu_single:0.20 cpu_multi:0.26 steal:0.20 disk_rand:0.10 disk_seq:0.08 mem:0.12 net_latency:0.02 net_loss:0.02
-下载存储|cpu_single:0.04 cpu_multi:0.04 steal:0.08 disk_rand:0.10 disk_seq:0.22 mem:0.06 net_bw:0.34 net_loss:0.12
+通用|cpu_single:0.12 cpu_multi:0.08 steal:0.12 disk_rand:0.12 disk_seq:0.06 disk_cap:0.04 mem:0.12 net_latency:0.10 net_loss:0.10 net_bw:0.08 ports:0.06
+建站|cpu_single:0.14 cpu_multi:0.06 steal:0.12 disk_rand:0.14 disk_seq:0.02 disk_cap:0.04 mem:0.16 net_latency:0.12 net_loss:0.10 net_bw:0.08 ports:0.02
+跨境代理|cpu_single:0.05 cpu_multi:0.03 steal:0.08 disk_rand:0.04 disk_seq:0.02 disk_cap:0.02 mem:0.06 net_latency:0.18 net_loss:0.18 net_bw:0.10 route_cn:0.12 ip_rep:0.10 media:0.02
+流媒体|cpu_single:0.05 cpu_multi:0.03 steal:0.06 disk_rand:0.03 disk_seq:0.02 disk_cap:0.02 mem:0.05 net_latency:0.10 net_loss:0.08 net_bw:0.10 ip_rep:0.20 media:0.26
+计算|cpu_single:0.20 cpu_multi:0.26 steal:0.20 disk_rand:0.10 disk_seq:0.08 disk_cap:0.02 mem:0.10 net_latency:0.02 net_loss:0.02
+下载存储|cpu_single:0.04 cpu_multi:0.04 steal:0.08 disk_rand:0.12 disk_seq:0.16 disk_cap:0.18 mem:0.06 net_bw:0.20 net_loss:0.12
 EOF
 }
 
@@ -474,7 +511,7 @@ echo -e "\n${B}=========================================${N}"
 echo -e "${B} 分项结果${N}"
 echo -e "${B}=========================================${N}"
 printf "  %-14s %-8s %-40s %s\n" "指标" "得分" "测量值" "备注"
-order=(cpu_single cpu_multi steal disk_rand disk_seq mem net_latency net_loss net_bw route_cn ip_rep media ports)
+order=(cpu_single cpu_multi steal disk_rand disk_seq disk_cap mem net_latency net_loss net_bw route_cn ip_rep media ports)
 for k in "${order[@]}"; do
   s=${SCORE[$k]:-}
   if [[ -z "$s" ]]; then printf "  ${D}%-14s %-8s %s${N}\n" "${NAME[$k]}" "N/A" "${RAW[$k]:-}";
@@ -484,7 +521,7 @@ done
 echo -e "\n${B}=========================================${N}"
 echo -e "${B} 场景评分（同一台机器，不同用途）${N}"
 echo -e "${B}=========================================${N}"
-declare -A PSCORE=() PCOVER=()
+declare -A PSCORE=() PCOVER=() PFLAG=()
 best=""; bestv=-1
 while IFS='|' read -r pname wlist; do
   [[ -z "$pname" ]] && continue
@@ -501,12 +538,15 @@ while IFS='|' read -r pname wlist; do
   cov=${den:1}
   cov=$(awk "BEGIN{printf \"%.2f\", ${den:1}}")
   PSCORE[$pname]=$val; PCOVER[$pname]=$cov
+  PFLAG[$pname]=0
+  awk -v c="$cov" 'BEGIN{exit !(c<0.50)}' && PFLAG[$pname]=1
   if awk -v a="$val" -v b="$bestv" 'BEGIN{exit !(a>b)}'; then best=$pname; bestv=$val; fi
 done < <(profiles)
 for pname in "${!PSCORE[@]}"; do
   bar_n=$(awk -v v="${PSCORE[$pname]}" 'BEGIN{printf "%d", v*2}')
   bar=$(printf '%0.s█' $(seq 1 "$bar_n" 2>/dev/null))
-  printf "  %-10s %s/10 %-22s 覆盖权重 %s\n" "$pname" "${PSCORE[$pname]}" "$bar" "${PCOVER[$pname]}"
+  warn=""; (( PFLAG[$pname] )) && warn="  ${Y}[样本不足，别信]${N}"
+  printf "  %-10s %s/10 %-22s 覆盖权重 %s%s\n" "$pname" "${PSCORE[$pname]}" "$bar" "${PCOVER[$pname]}" "$warn"
 done
 
 # 短板：按得分升序，列出有实测值的最低 3 项
