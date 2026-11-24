@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# vpscheck v6.4 — 场景化 VPS 评测
-# VPSCHECK_BUILD=20261125-0801
+# vpscheck v6.5 — 场景化 VPS 评测
+# VPSCHECK_BUILD=20261125-0900
 #
 # 设计原则：
 #   1. 不把「硬件质量」和「用途适配」混成一个分数，按场景分别出分
@@ -18,16 +18,18 @@ set -uo pipefail
 QUICK=0
 INSTALL=0
 SITE_URL="${SITE_URL:-}"
+BW_MBPS="${BW_MBPS:-}"       # 已知套餐带宽(Mbps)时直接填入，跳过实测，避免 CDN 虚高
 for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=1 ;;
     --install-deps) INSTALL=1 ;;
     --version)
-      echo "vpscheck v6.4 (build 20261125-0801)"
+      echo "vpscheck v6.5 (build 20261125-0900)"
       exit 0 ;;
     -h|--help)
       echo "用法: bash $0 [--quick] [--install-deps] [--version]"
       echo "  SITE_URL=https://你的域名 bash $0   测到你自己网站的 TCP 握手/首字节时间"
+      echo "  BW_MBPS=30 bash $0                已知套餐带宽(Mbps)时直接指定，跳过实测"
       echo "启动时会询问是否安装缺失工具；--install-deps 表示不再询问直接装"
       exit 0 ;;
     *) echo "未知参数: $arg"; exit 1 ;;
@@ -171,8 +173,8 @@ NAME[ports]="出站端口"
 
 MODE_NAME="完整模式"; (( QUICK )) && MODE_NAME="快速模式"
 echo "${B}=========================================${N}"
-echo "${B} VPS 评测 v6.4 — 场景化评分 (${MODE_NAME})${N}"
-echo "${D} 构建标记: 20261125-0801${N}"
+echo "${B} VPS 评测 v6.5 — 场景化评分 (${MODE_NAME})${N}"
+echo "${D} 构建标记: 20261125-0900${N}"
 echo "${B} 测不到 → N/A，不估算；一次跑完，按场景分别出分${N}"
 echo "${B}=========================================${N}"
 
@@ -387,11 +389,14 @@ if (( ${#connects[@]} == 0 )); then
 else
   med=$(median "${connects[@]}"); tt=$(median "${ttfbs[@]}")
   failrate=$(awk -v f="$fail" -v n="$tried" 'BEGIN{printf "%.1f",(n>0 ? f*100/n : 100)}')
-  lscore=$(tier_score_low "$med" "0.05:10 0.10:9 0.20:8 0.35:6 0.60:4")
+  # 握手和首字节分别打分，取较低者：握手快但服务器响应慢同样拖垮体验
+  cs=$(tier_score_low "$med" "0.005:10 0.01:9 0.03:8 0.08:6 0.15:4 0.30:2")
+  ts=$(tier_score_low "$tt"  "0.05:10 0.10:9 0.20:8 0.35:6 0.60:4 1.00:2")
+  lscore=$(( cs<ts ? cs : ts ))
   loss_score=$(tier_score_low "$failrate" "0.1:10 2:9 5:7 10:5 20:3")
-  record net_latency "$lscore" "TCP握手中位 ${med}s / 首字节 ${tt}s" "真实 HTTPS 连接；SITE_URL 可加入你自己的网站"
+  record net_latency "$lscore" "握手 ${med}s(${cs}) / 首字节 ${tt}s(${ts})" "握手+首字节取低者；SITE_URL 可加入你自己的网站"
   record net_loss "$loss_score" "连接失败率 ${failrate}% (${fail}/${tried})" "按连接失败计，不再用 ICMP 丢包代替"
-  echo "  TCP中位: ${med}s | 首字节中位: ${tt}s | 失败率: ${failrate}% -> 延迟${lscore}/10 可用性${loss_score}/10"
+  echo "  握手: ${med}s(${cs}/10) | 首字节: ${tt}s(${ts}/10) | 失败率: ${failrate}% -> 延迟取低 ${lscore}/10 可用性${loss_score}/10"
 fi
 
 # ---------------------------------------------------------------- 5. 去程线路
@@ -432,675 +437,53 @@ else
   fi
 fi
 
-# ---------------------------------------------------------------- 6. 带宽（多目标，不依赖单一 Ookla 服务器）
-echo -e "\n${Y}[6/8] 带宽 (多目标下载，取中位)${N}"
-if [[ $QUICK -eq 1 ]]; then
-  skip net_bw "快速模式跳过" "完整模式测多个 CDN 端点"
+# ---------------------------------------------------------------- 6. 带宽
+# 原则：不用单一 Ookla；不用会被对等互联虚高的 Cloudflare；实测取"各端点中位的较低者"，
+#       因为套餐限速是硬上限，虚高只来自个别 CDN 对等互联，较低者更接近真实出口。
+#       已知套餐带宽时用 BW_MBPS 直接指定，实测仅作对照。
+echo -e "\n${Y}[6/8] 带宽 (双端点实测取低；BW_MBPS 可指定套餐值)${N}"
+# BW_MBPS 无需测速，快速模式下也直接采用
+if [[ -n "$BW_MBPS" ]] && awk -v x="$BW_MBPS" 'BEGIN{exit !((x+0)>0)}'; then
+  bs=$(tier_score "$BW_MBPS" "200:10 100:9 50:8 30:7 15:5 5:3")
+  record net_bw "$bs" "${BW_MBPS} Mbps (用户指定套餐值)" "实测仅作对照，套餐限速以用户填写为准"
+  echo "  套餐带宽: ${BW_MBPS} Mbps [用户指定] -> ${bs}/10"
+elif [[ $QUICK -eq 1 ]]; then
+  skip net_bw "快速模式跳过" "完整模式测多个 CDN 端点；或 BW_MBPS=30 指定"
 else
   bw_urls=(
-    "Cloudflare|https://speed.cloudflare.com/__down?bytes=10485760"
-    "OVH|https://proof.ovh.net/files/10Mb.dat"
-    "Tele2|https://speedtest.tele2.net/10MB.zip"
+    "OVH|https://proof.ovh.net/files/100Mb.dat"
+    "Cachefly|https://cachefly.cachefly.net/10mb.test"
   )
-  vals=(); labs=()
+  endpoint_med=(); labs=()
   for item in "${bw_urls[@]}"; do
     lab=${item%%|*}; url=${item#*|}
-    got=""
-    for i in 1 2; do
-      sp=$(timeout 25 curl -sL -o /dev/null --max-time 22 -w '%{speed_download}' "$url" 2>/dev/null)
-      if [[ -n "$sp" ]] && awk -v x="$sp" 'BEGIN{exit !(x>0)}'; then
-        mbps=$(awk -v x="$sp" 'BEGIN{printf "%.2f", x*8/1000000}')
-        vals+=("$mbps"); [[ -z "$got" ]] && got="$mbps"
-      fi
-    done
-    if [[ -n "$got" ]]; then labs+=("${lab}:${got}"); echo "  ${lab}: ${got} Mbps"; else echo "  ${lab}: 失败"; fi
-  done
-  if (( ${#vals[@]} )); then
-    bw=$(median "${vals[@]}"); lo=$(printf '%s\n' "${vals[@]}" | sort -n | head -1); hi=$(printf '%s\n' "${vals[@]}" | sort -n | tail -1)
-    bs=$(tier_score "$bw" "200:10 100:9 50:8 30:7 15:5 5:3")
-    pen=0
-    if awk -v a="$lo" -v b="$bw" 'BEGIN{exit !((b>0)&&(a<b*0.5))}'; then bs=$(( bs>1 ? bs-1 : 1 )); pen=1; fi
-    record net_bw "$bs" "中位 ${bw} / 最低 ${lo} / 最高 ${hi} Mbps" "$(IFS=' '; echo "${labs[*]}")；多目标 curl 实测${pen:+；低速波动扣1分}"
-    echo "  中位: ${bw} Mbps (最低 ${lo}, 最高 ${hi}) -> ${bs}/10"
-  else
-    skip net_bw "全部目标失败" "不给默认分"
-  fi
-fi
-
-# ---------------------------------------------------------------- 7. IP 信息（不直接加分）
-echo -e "\n${Y}[7/8] IP 信息${N}"
-ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-geo=$(curl -s --max-time 5 'http://ip-api.com/json/?fields=status,country,countryCode,city,isp,as,hosting' 2>/dev/null)
-if [[ -n "$geo" ]]; then
-  country=$(echo "$geo" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')
-  city=$(echo "$geo" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
-  isp=$(echo "$geo" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')
-  asn=$(echo "$geo" | sed -n 's/.*"as":"\([^"]*\)".*/\1/p')
-  echo "  IP: ${ip:-未知} | ${country:-?} ${city:-?} | ${isp:-?}"
-  echo "  ASN: ${asn:-?} | hosting: $(echo "$geo" | grep -oE '"hosting":(true|false)' | head -1 | cut -d: -f2)"
-fi
-# 注册国/定位国只作为提示，不做「原生+2 / 广播-?」的伪科学加分
-reg=$(curl -s --max-time 5 https://ipinfo.io/country 2>/dev/null | grep -oE '^[A-Z]{2}$' | head -1)
-cc=$(echo "$geo" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
-if [[ -n "$reg" && -n "$cc" ]]; then
-  echo "  ${D}注册国=$reg / 定位国=$cc （差异只作参考，不计分：两家数据库更新不同步很常见）${N}"
-fi
-# 实际延迟远低于 IP 归属地应有水平 → 疑似广播 IP / 地理库误标，只提示不计分
-if [[ -n "${med:-}" && -n "$cc" ]]; then
-  case "$cc" in
-    CN|HK|TW|SG|JP|KR) : ;;
-    *)
-      if le "$med" 0.06; then
-        echo "  ${Y}提示：TCP 握手 ${med}s 与 IP 归属地 ${country:-$cc} 明显不符，疑似广播 IP 或地理库误标；实际位置以延迟为准，此项不计分。${N}"
-      fi
-      ;;
-  esac
-fi
-# DNSBL 反查，真实信誉信号
-if [[ -n "$ip" ]] && (need dig || need host || need getent); then
-  rev=$(echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')
-  if need dig; then ans=$(timeout 5 dig +short "${rev}.zen.spamhaus.org" 2>/dev/null)
-  elif need host; then ans=$(timeout 5 host "${rev}.zen.spamhaus.org" 2>/dev/null | grep -oE '127\.0\.0\.[0-9]+' | head -1)
-  else ans=$(timeout 5 getent hosts "${rev}.zen.spamhaus.org" 2>/dev/null | awk '{print $1}'); fi
-  ans=$(echo "$ans" | head -1 | tr -d '\r')
-  if [[ "$ans" =~ ^127\.0\.0\.([2-9]|1[01])$ ]]; then
-    record ip_rep 2 "命中 Spamhaus: ${ans}" "被主流反垃圾库标记，邮件/注册类业务风险高"
-    echo "  ${R}IP 信誉: 命中 Spamhaus (${ans})${N}"
-  elif [[ -n "$ans" ]]; then
-    skip ip_rep "查询异常: ${ans}" "非标准 Spamhaus 返回码，多为 DNS 通配符/NXDOMAIN 劫持，不计分"
-    echo "  ${Y}IP 信誉: 查询返回 ${ans}，判定为异常，跳过${N}"
-  else
-    record ip_rep 9 "Spamhaus 未命中" "仅代表未上反垃圾库，不等于平台不封"
-    echo "  IP 信誉: Spamhaus 未命中"
-  fi
-else
-  skip ip_rep "无法查询" "缺少 IP 或 DNS 工具，不给默认分"
-fi
-
-# ---------------------------------------------------------------- 8. 流媒体与端口
-echo -e "\n${Y}[8/8] 流媒体可用性 & 出站端口${N}"
-UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-http_code() { curl -sL -o /dev/null -w '%{http_code}' --max-time 8 -A "$UA" "$1" 2>/dev/null; }
-passed=0; total=0
-nf=$(http_code 'https://www.netflix.com/title/81280792')
-[[ "$nf" == "200" || "$nf" == "404" ]] && passed=$((passed+1)); total=$((total+1))
-echo "  Netflix: ${nf:-无响应} ($([[ "$nf" == "200" || "$nf" == "404" ]] && echo 可用 || echo 不可用))"
-
-yt=$(curl -s --max-time 8 -H 'Accept-Language: en' 'https://www.youtube.com/premium' 2>/dev/null)
-if echo "$yt" | grep -q 'YouTube and YouTube Music ad-free'; then passed=$((passed+1)); fi
-total=$((total+1)); echo "  YouTube Premium: $(echo "$yt" | grep -q 'ad-free' && echo 可用 || echo 不可用)"
-
-tt=$(curl -sL --max-time 8 -A "$UA" 'https://www.tiktok.com/' 2>/dev/null)
-ttc=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 8 -A "$UA" 'https://www.tiktok.com/' 2>/dev/null)
-ttr=$(echo "$tt" | grep -oE '"region":"[A-Z]{2,5}"' | head -1 | cut -d'"' -f4)
-if [[ "$ttc" == "200" || "$ttc" == "302" ]]; then passed=$((passed+1)); fi
-total=$((total+1)); echo "  TikTok: ${ttc:-无响应} (区域 ${ttr:-未知})"
-
-cg=$(curl -s --max-time 8 'https://chat.openai.com/cdn-cgi/trace' 2>/dev/null | awk -F= '/^loc=/{print $2}')
-if [[ -n "$cg" && "$cg" != "XX" && "$cg" != "T1" ]]; then passed=$((passed+1)); fi
-total=$((total+1)); echo "  ChatGPT: ${cg:-不可达}"
-
-bili_code() { curl -s --max-time 8 -A "$UA" "$1" 2>/dev/null | grep -oE '"code":[0-9]+' | head -1 | cut -d: -f2; }
-bili=$(bili_code 'https://api.bilibili.com/pgc/player/web/playurl?avid=82846771&ep_id=307247&fnval=0')
-[[ "$bili" == "0" ]] && bl="大陆" || { bili=$(bili_code 'https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&ep_id=183799&fnval=0'); [[ "$bili" == "0" ]] && bl="港澳台"; }
-if [[ -z "${bl:-}" ]]; then bili=$(bili_code 'https://api.bilibili.com/pgc/player/web/playurl?avid=50762638&ep_id=268176&fnval=0'); [[ "$bili" == "0" ]] && bl="台湾"; fi
-[[ -n "${bl:-}" ]] && passed=$((passed+1)); total=$((total+1))
-echo "  Bilibili: ${bl:-不可用}"
-
-iq=$(curl -sI --max-time 8 -A "$UA" 'https://www.iq.com/' 2>/dev/null | grep -oE 'mod=[a-zA-Z]+' | head -1 | cut -d= -f2)
-[[ -n "$iq" ]] && passed=$((passed+1)); total=$((total+1))
-echo "  iQIYI: $([[ -n "$iq" ]] && echo "可用 (区域 ${iq})" || echo 不可用)"
-[[ $total -gt 0 ]] && record media "$(( passed*10/total ))" "${passed}/${total} 项可用" "流媒体是用途不是机器质量；只在该场景权重里起作用"
-
-pc=0; plist=()
-for ep in '1.1.1.1:443:DNS-over-TLS' 'www.google.com:80:HTTP' 'smtp.gmail.com:25:SMTP'; do
-  eh=${ep%%:*}; rest=${ep#*:}; epport=${rest%%:*}; elab=${rest##*:}
-  if timeout 3 bash -c "echo >/dev/tcp/$eh/$epport" 2>/dev/null; then pc=$((pc+1)); plist+=("$elab✓"); else plist+=("$elab✗"); fi
-done
-record ports "$(( pc*10/3 ))" "$(IFS=' '; echo "${plist[*]}")" "仅出站可达性；入站端口需在外部扫描，本机测不了"
-echo "  出站端口: $(IFS=' '; echo "${plist[*]}")"
-
-# ---------------------------------------------------------------- 场景权重
-# 每个场景权重之和 = 1.00；N/A 项权重自动从分母移除
-profiles() {
-cat <<'EOF'
-通用|cpu_single:0.12 cpu_multi:0.08 steal:0.12 disk_rand:0.12 disk_seq:0.06 disk_cap:0.04 mem:0.12 net_latency:0.10 net_loss:0.10 net_bw:0.08 ports:0.06
-建站|cpu_single:0.14 cpu_multi:0.06 steal:0.12 disk_rand:0.14 disk_seq:0.02 disk_cap:0.04 mem:0.16 net_latency:0.12 net_loss:0.10 net_bw:0.08 ports:0.02
-跨境代理|cpu_single:0.05 cpu_multi:0.03 steal:0.08 disk_rand:0.04 disk_seq:0.02 disk_cap:0.02 mem:0.06 net_latency:0.18 net_loss:0.18 net_bw:0.10 route_cn:0.12 ip_rep:0.10 media:0.02
-流媒体|cpu_single:0.05 cpu_multi:0.03 steal:0.06 disk_rand:0.03 disk_seq:0.02 disk_cap:0.02 mem:0.05 net_latency:0.10 net_loss:0.08 net_bw:0.10 ip_rep:0.20 media:0.26
-计算|cpu_single:0.20 cpu_multi:0.26 steal:0.20 disk_rand:0.10 disk_seq:0.08 disk_cap:0.02 mem:0.10 net_latency:0.02 net_loss:0.02
-下载存储|cpu_single:0.04 cpu_multi:0.04 steal:0.08 disk_rand:0.12 disk_seq:0.16 disk_cap:0.18 mem:0.06 net_bw:0.20 net_loss:0.12
-EOF
-}
-
-echo -e "\n${B}=========================================${N}"
-echo -e "${B} 分项结果${N}"
-echo -e "${B}=========================================${N}"
-printf "  %-14s %-8s %-40s %s\n" "指标" "得分" "测量值" "备注"
-order=(cpu_single cpu_multi steal disk_rand disk_seq disk_cap mem net_latency net_loss net_bw route_cn ip_rep media ports)
-for k in "${order[@]}"; do
-  s=${SCORE[$k]:-}
-  if [[ -z "$s" ]]; then printf "  ${D}%-14s %-8s %s${N}\n" "${NAME[$k]}" "N/A" "${RAW[$k]:-}";
-  else printf "  %-14s %-8s %-40s %s\n" "${NAME[$k]}" "${s}/10" "${RAW[$k]:-}" "${NOTE[$k]:-}"; fi
-done
-
-echo -e "\n${B}=========================================${N}"
-echo -e "${B} 场景评分（同一台机器，不同用途）${N}"
-echo -e "${B}=========================================${N}"
-declare -A PSCORE=() PCOVER=() PFLAG=()
-best=""; bestv=-1
-while IFS='|' read -r pname wlist; do
-  [[ -z "$pname" ]] && continue
-  num=""; den=""
-  for spec in $wlist; do
-    k=${spec%%:*}; w=${spec##*:}; v=${SCORE[$k]:-}
-    [[ -z "$v" ]] && continue
-    num="${num}+${w}*${v}"; den="${den}+${w}"
-  done
-  if [[ -z "$den" ]]; then
-    printf "  %-10s %s\n" "$pname" "N/A — 无可用指标"; continue
-  fi
-  val=$(awk "BEGIN{printf \"%.1f\", (${num:1})/(${den:1})}")
-  cov=${den:1}
-  cov=$(awk "BEGIN{printf \"%.2f\", ${den:1}}")
-  PSCORE[$pname]=$val; PCOVER[$pname]=$cov
-  PFLAG[$pname]=0
-  awk -v c="$cov" 'BEGIN{exit !(c<0.80)}' && PFLAG[$pname]=1
-  if awk -v a="$val" -v b="$bestv" 'BEGIN{exit !(a>b)}'; then best=$pname; bestv=$val; fi
-done < <(profiles)
-for pname in "${!PSCORE[@]}"; do
-  bar_n=$(awk -v v="${PSCORE[$pname]}" 'BEGIN{printf "%d", v*2}')
-  bar=$(printf '%0.s█' $(seq 1 "$bar_n" 2>/dev/null))
-  warn=""; (( PFLAG[$pname] )) && warn="  ${Y}[样本不足，别信]${N}"
-  printf "  %-10s %s/10 %-22s 覆盖权重 %s%s\n" "$pname" "${PSCORE[$pname]}" "$bar" "${PCOVER[$pname]}" "$warn"
-done
-
-# 短板：按得分升序，列出有实测值的最低 3 项
-echo -e "\n${Y}主要短板${N}"
-for k in "${!SCORE[@]}"; do
-  [[ -z "${SCORE[$k]}" ]] && continue
-  echo "${SCORE[$k]} ${NAME[$k]} ${RAW[$k]}"
-done | sort -n | head -3 | while read -r s n r; do printf "  - %-14s %s/10  (%s)\n" "$n" "$s" "$r"; done
-
-if [[ "$bestv" == "-1" ]]; then
-  echo -e "\n${Y}结论：可用指标不足，无法评分。${N}"
-else
-  if awk -v c="${PCOVER[$best]:-0}" 'BEGIN{exit !(c<0.80)}'; then
-    echo -e "\n${Y}结论：${best} 相对最好 (${bestv}/10)，但只覆盖 ${PCOVER[$best]} 权重，样本不足，不能用于购买决策。${N}"
-  else
-    echo -e "\n${G}结论：${best} 场景表现最好 (${bestv}/10，覆盖 ${PCOVER[$best]})${N}"
-  fi
-fi
-miss=0
-for k in "${!SCORE[@]}"; do [[ -z "${SCORE[$k]}" ]] && miss=$((miss+1)); done
-(( miss > 0 )) && echo "  ${Y}${miss} 项未测到，已按权重剔除而非估算；分数存在覆盖偏差。${N}"
-echo "  ${D}注：流媒体/解锁只代表用途适配，不代表机器质量；线路项为去程，回程需国内探针另测。${N}"
-#!/usr/bin/env bash
-# vpscheck v6.4 — 场景化 VPS 评测
-# VPSCHECK_BUILD=20261125-0801
-#
-# 设计原则：
-#   1. 不把「硬件质量」和「用途适配」混成一个分数，按场景分别出分
-#   2. 测不到就标记 N/A 并重分配权重，绝不估算、绝不编造
-#   3. 关键指标取中位数/多次采样，不取最大值，不拿单次瞬时值定生死
-#   4. 只报告能测的东西；去程就是去程，不冒充回程；原生/广播只作信息不作加分
-#
-# 用法: bash vpscheck [--quick] [--install-deps] [--version]
-#   --quick         跳过测速和路由探测，缩短到约 30 秒
-#   --install-deps  由脚本尝试安装缺失的依赖（默认先询问）
-#   --version       只打印版本，立刻退出，用来确认线上文件是否更新
-
-set -uo pipefail
-
-QUICK=0
-INSTALL=0
-SITE_URL="${SITE_URL:-}"
-for arg in "$@"; do
-  case "$arg" in
-    --quick) QUICK=1 ;;
-    --install-deps) INSTALL=1 ;;
-    --version)
-      echo "vpscheck v6.4 (build 20261125-0801)"
-      exit 0 ;;
-    -h|--help)
-      echo "用法: bash $0 [--quick] [--install-deps] [--version]"
-      echo "  SITE_URL=https://你的域名 bash $0   测到你自己网站的 TCP 握手/首字节时间"
-      echo "启动时会询问是否安装缺失工具；--install-deps 表示不再询问直接装"
-      exit 0 ;;
-    *) echo "未知参数: $arg"; exit 1 ;;
-  esac
-done
-
-if [[ -t 1 ]]; then
-  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[34m'; D=$'\033[2m'; N=$'\033[0m'
-else
-  R=''; G=''; Y=''; B=''; D=''; N=''
-fi
-
-WORKDIR=$(mktemp -d /tmp/vpscheck.XXXXXX 2>/dev/null || echo /tmp/vpscheck.$$)
-trap 'rm -rf "$WORKDIR"' EXIT
-
-# ---------------------------------------------------------------- 基础工具
-missing=()
-for c in awk ping curl timeout; do
-  command -v "$c" >/dev/null 2>&1 || missing+=("$c")
-done
-if (( ${#missing[@]} )); then
-  echo "${R}缺少基础命令: ${missing[*]}${N}"
-  echo "Debian/Ubuntu: apt update && apt install -y iputils-ping curl coreutils"
-  echo "RHEL/CentOS : yum install -y iputils curl coreutils"
-  exit 1
-fi
-
-need() {
-  command -v "$1" >/dev/null 2>&1
-}
-APT_UPDATED=0
-install_pkg() {
-  local cmd=$1 pkg=$2
-  need "$cmd" && return 0
-  if (( ! INSTALL )); then
-    echo "  ${Y}缺少 $cmd ($pkg)${N}"
-    return 1
-  fi
-  if need apt-get; then
-    (( APT_UPDATED )) || { apt-get update -qq </dev/null >/dev/null 2>&1; APT_UPDATED=1; }
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" </dev/null >/dev/null 2>&1
-  elif need yum; then
-    yum install -y "$pkg" </dev/null >/dev/null 2>&1
-  elif need dnf; then
-    dnf install -y "$pkg" </dev/null >/dev/null 2>&1
-  fi
-  if need "$cmd"; then return 0; fi
-  echo "  ${R}安装失败：$pkg${N}"
-  return 1
-}
-
-# 从终端读答案，而不是从 stdin：
-# 用户用 curl ... | bash 运行时 stdin 是脚本本身，普通 read 会读不到或吃掉脚本
-ask_user() {
-  local prompt=$1 ans=""
-  if [[ -e /dev/tty ]]; then
-    printf '%s' "$prompt" 2>/dev/null >/dev/tty || return 1
-    IFS= read -r ans 2>/dev/null </dev/tty || { printf '\n' 2>/dev/null >/dev/tty; return 1; }
-    ANSWER="$ans"
-    return 0
-  fi
-  [[ -t 0 ]] || return 1
-  read -r -p "$prompt" ans || return 1
-  ANSWER="$ans"
-}
-
-# 开跑前先问要不要装缺失工具；真没终端（定时任务等）才跳过
-preflight() {
-  local -a pairs=("sysbench:sysbench" "fio:fio")
-  (( QUICK )) || pairs+=("traceroute:traceroute" "mtr:mtr")
-  local -a miss_cmd=() miss_pkg=()
-  local item c p answer i
-  for item in "${pairs[@]}"; do
-    c=${item%%:*}; p=${item##*:}
-    need "$c" || { miss_cmd+=("$c"); miss_pkg+=("$p"); }
-  done
-  (( ${#miss_cmd[@]} )) || return 0
-  echo "  ${Y}缺少工具：${miss_pkg[*]}${N}"
-  if (( INSTALL )); then
-    answer="y"
-  elif ask_user "  是否现在自动安装？需要 root 权限。直接回车=安装，输入 n=跳过 [Y/n] "; then
-    answer="$ANSWER"
-  else
-    echo "  ${D}没有可用终端，跳过安装；可加 --install-deps 强制安装${N}"
-    return 0
-  fi
-  case "$answer" in
-    ""|y|Y|yes|YES|Yes)
-      INSTALL=1
-      for i in "${!miss_cmd[@]}"; do
-        echo "  → 安装 ${miss_pkg[$i]} ..."
-        install_pkg "${miss_cmd[$i]}" "${miss_pkg[$i]}" || echo "  ${R}跳过 ${miss_pkg[$i]}${N}"
-      done
-      ;;
-    *)
-      echo "  ${D}已跳过，相关项目会显示 N/A${N}"
-      ;;
-  esac
-}
-
-ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 >= b+0)}'; }
-le() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 <= b+0)}'; }
-avg() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f",(a+b)/2}'; }
-median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'; }
-# tier_score <value> "阈值:分数 阈值:分数 ..."  从高到低匹配，越大越好
-tier_score() {
-  local v=$1 all="${*:2}" pair t s
-  for pair in $all; do
-    t=${pair%%:*}; s=${pair##*:}
-    ge "$v" "$t" && { echo "$s"; return; }
-  done
-  echo 2
-}
-# 越小越好：steal / 延迟 / 丢包
-tier_score_low() {
-  local v=$1 all="${*:2}" pair t s
-  for pair in $all; do
-    t=${pair%%:*}; s=${pair##*:}
-    le "$v" "$t" && { echo "$s"; return; }
-  done
-  echo 2
-}
-
-declare -A SCORE=() RAW=() NOTE=() NAME=()
-record() { SCORE[$1]=$2; RAW[$1]=$3; NOTE[$1]=${4:-}; }
-skip()   { SCORE[$1]="";  RAW[$1]=$2; NOTE[$1]=${3:-}; }
-NAME[cpu_single]="CPU单核"
-NAME[cpu_multi]="CPU多核扩展"
-NAME[steal]="超售/抢占"
-NAME[disk_rand]="磁盘随机IO"
-NAME[disk_seq]="磁盘顺序吞吐"
-NAME[disk_cap]="磁盘容量"
-NAME[mem]="可用内存"
-NAME[net_latency]="网络延迟"
-NAME[net_loss]="网络丢包"
-NAME[net_bw]="带宽"
-NAME[route_cn]="国内去程线路"
-NAME[ip_rep]="IP信誉"
-NAME[media]="流媒体适配"
-NAME[ports]="出站端口"
-
-MODE_NAME="完整模式"; (( QUICK )) && MODE_NAME="快速模式"
-echo "${B}=========================================${N}"
-echo "${B} VPS 评测 v6.4 — 场景化评分 (${MODE_NAME})${N}"
-echo "${D} 构建标记: 20261125-0801${N}"
-echo "${B} 测不到 → N/A，不估算；一次跑完，按场景分别出分${N}"
-echo "${B}=========================================${N}"
-
-echo -e "\n${Y}启动前检查工具${N}"
-preflight
-
-# ---------------------------------------------------------------- 1. CPU
-echo -e "\n${Y}[1/8] CPU 性能与超售情况${N}"
-cpu_model=$(awk -F: '/^model name/{gsub(/^ +| +$/,"",$2); print $2; exit}' /proc/cpuinfo)
-cores=$(nproc 2>/dev/null || echo 1)
-echo "  型号: ${cpu_model:-未知} | 逻辑核: $cores"
-
-steal_mode="unknown"; steal_val=""
-if [[ -r /proc/stat ]]; then
-  prev_t=""; prev_s=""; samples=()
-  for ((i=1; i<=5; i++)); do
-    read -r ct cs < <(awk '/^cpu /{t=0; for(j=2;j<=NF;j++)t+=$j; print t, ($9==""?"-1":$9)}' /proc/stat)
-    if [[ -n "$prev_t" && "$cs" != "-1" && "$prev_s" != "-1" ]]; then
-      samples+=("$(awk -v a="$prev_s" -v b="$cs" -v ta="$prev_t" -v tb="$ct" \
-        'BEGIN{d=tb>ta?((b-a)/(tb-ta)*100):0; printf "%.2f",(d>0?d:0)}')")
-    fi
-    prev_t="$ct"; prev_s="$cs"
-    (( i < 5 )) && sleep 1
-  done
-  if (( ${#samples[@]} )); then
-    steal_mode="ok"
-    # 取 4 段 1 秒采样的峰值，避免瞬时低抢占掩盖问题
-    steal_val=$(printf '%s\n' "${samples[@]}" | sort -nr | head -1)
-  fi
-fi
-if [[ "$steal_mode" == "ok" ]]; then
-  ss=$(tier_score_low "$steal_val" "1:10 3:8 6:6 10:4")
-  record steal "$ss" "${steal_val}% (4次采样峰值)" "steal 越低越好；>5% 通常意味着明显超售"
-  echo "  steal: ${steal_val}% -> ${ss}/10"
-else
-  skip steal "不可读" "容器/内核未暴露 steal 字段，该项不计分"
-  echo "  ${D}steal 不可读，跳过${N}"
-fi
-
-if install_pkg sysbench sysbench; then
-  sbver=$(sysbench --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-  if [[ "$(echo "${sbver:-0}" | cut -d. -f1)" -ge 1 ]]; then
-    singles=()
+    evals=()
     for i in 1 2 3; do
-      out=$(timeout 20 sysbench cpu --cpu-max-prime=20000 --threads=1 --time=3 run 2>/dev/null)
-      v=$(echo "$out" | awk -F: '/events per second/{gsub(/ /,"",$2); print $2; exit}')
-      [[ -n "$v" ]] && singles+=("$v")
-    done
-    if (( ${#singles[@]} )); then
-      single=$(printf '%s\n' "${singles[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
-      s1=$(tier_score "$single" "2500:10 1800:9 1300:8 900:6 600:4")
-      record cpu_single "$s1" "${single} events/s (3取中位)" "sysbench $sbver，单核；数值因版本/prime参数而异，仅作相对参考"
-      echo "  单核(中位): ${single} events/s -> ${s1}/10"
-      # 多核扩展效率
-      mout=$(timeout 20 sysbench cpu --cpu-max-prime=20000 --threads="$cores" --time=3 run 2>/dev/null)
-      multi=$(echo "$mout" | awk -F: '/events per second/{gsub(/ /,"",$2); print $2; exit}')
-      if [[ -n "$multi" ]]; then
-        eff=$(awk -v m="$multi" -v s="$single" -v c="$cores" 'BEGIN{printf "%.2f", (s>0? m/(s*c) : 0)}')
-        s2=$(tier_score "$eff" "0.9:10 0.7:8 0.5:6 0.3:4")
-        record cpu_multi "$s2" "扩展效率 ${eff}x (${multi} events/s)" "多核 / (单核×逻辑核)；接近 1 说明扩展良好"
-        echo "  多核扩展: ${eff}x -> ${s2}/10"
-      else
-        skip cpu_multi "无数据" "多核测试失败"
-      fi
-    else
-      skip cpu_single "无数据" "sysbench 运行失败，可能是环境限制"
-      skip cpu_multi "无数据" "sysbench 运行失败"
-    fi
-  else
-    skip cpu_single "sysbench ${sbver:-旧版}" "sysbench <1.0 的结果与新版不可比，不给分"
-    skip cpu_multi "sysbench ${sbver:-旧版}" "同上"
-  fi
-else
-  skip cpu_single "未安装 sysbench" "加 --install-deps 自动安装，或手动 apt/yum install sysbench"
-  skip cpu_multi "未安装 sysbench" "同上"
-fi
-
-# ---------------------------------------------------------------- 2. 磁盘
-echo -e "\n${Y}[2/8] 磁盘性能${N}"
-root_dev=$(df -P / 2>/dev/null | awk 'NR==2{print $1}')
-root_size=$(df -h / 2>/dev/null | awk 'NR==2{print $2}')
-echo "  根分区: ${root_dev:-未知} (${root_size:-未知})"
-cap_num=$(echo "$root_size" | grep -oE '[0-9.]+' | head -1)
-cap_unit=$(echo "$root_size" | grep -oE '[KMGT]i?B|[KMGT]' | head -1 | tr -d 'iB')
-if [[ -n "$cap_num" ]]; then
-  case "$cap_unit" in
-    T) cap_gb=$(awk -v x="$cap_num" 'BEGIN{printf "%.0f",x*1024}') ;;
-    M) cap_gb=$(awk -v x="$cap_num" 'BEGIN{printf "%.1f",x/1024}') ;;
-    K) cap_gb=$(awk -v x="$cap_num" 'BEGIN{printf "%.3f",x/1048576}') ;;
-    *) cap_gb=$cap_num ;;
-  esac
-  capscore=$(tier_score "$cap_gb" "500:10 200:9 100:8 50:7 20:5 10:3")
-  record disk_cap "$capscore" "${root_size} (约${cap_gb}GB)" "根分区容量；速度高不等于能存东西"
-  echo "  系统盘容量: ${root_size} -> ${capscore}/10"
-else
-  skip disk_cap "${root_size:-未知}" "无法解析容量"
-fi
-
-if install_pkg fio fio; then
-  fio_iops() {
-    local mode=$1 bs=$2 rw=$3 runtime=$4
-    timeout $((runtime+8)) fio --name=vpscheck --directory="$WORKDIR" --size=128m \
-      --bs="$bs" --rw="$rw" --ioengine=libaio --direct=1 --iodepth=32 --numjobs=1 \
-      --runtime="$runtime" --time_based --group_reporting 2>/dev/null
-  }
-  parse_iops() {
-    local out=$1 kind=$2 v
-    v=$(echo "$out" | grep -oE "${kind}: IOPS=[0-9.]+[kK]?" | head -1 | grep -oE '[0-9.]+[kK]?' | head -1)
-    [[ -z "$v" ]] && { echo ""; return; }
-    if [[ "$v" =~ [kK]$ ]]; then awk -v x="${v%[kK]}" 'BEGIN{printf "%.0f",x*1000}'
-    else awk -v x="$v" 'BEGIN{printf "%.0f",x}'; fi
-  }
-  rt=5; [[ $QUICK -eq 1 ]] && rt=2
-  out_r=$(fio_iops r 4k randread "$rt")
-  out_w=$(fio_iops w 4k randwrite "$rt")
-  ior=$(parse_iops "$out_r" read); iow=$(parse_iops "$out_w" write)
-  p99=$(echo "$out_r" | grep -oE '99\.00th=\[[^]]+\]' | head -1 | grep -oE '[0-9.]+[kK]?' | head -1)
-  if [[ -n "$ior" && -n "$iow" ]]; then
-    sr=$(tier_score "$ior" "100000:10 50000:9 20000:8 10000:6 3000:4")
-    sw=$(tier_score "$iow" "100000:10 50000:9 20000:8 10000:6 3000:4")
-    base=$(( sr < sw ? sr : sw ))
-    penalty=0
-    if [[ -n "$p99" ]]; then
-      p99n=${p99%[kK]}; [[ "$p99" =~ [kK]$ ]] && p99n=$(awk -v x="$p99n" 'BEGIN{printf "%.0f",x*1000}')
-      ge "$p99n" 50000 && penalty=2 || { ge "$p99n" 20000 && penalty=1; }
-    fi
-    ds=$(( base > penalty ? base-penalty : 1 ))
-    record disk_rand "$ds" "读${ior} / 写${iow} IOPS, p99≈${p99:-?}us" "4K 随机，direct=1；读写取较低值，高尾延迟扣分；根分区 ${root_size:-?}"
-    echo "  4K随机: 读${ior} / 写${iow} IOPS -> ${ds}/10"
-  else
-    skip disk_rand "fio 无有效输出" "可能后端不支持 direct I/O；不改用缓存测法，避免虚高"
-    echo "  ${D}fio 输出无效，跳过${N}"
-  fi
-  out_s=$(fio_iops s 1m read 3)
-  bw_line=$(echo "$out_s" | grep -oE 'read:.*BW=[0-9.]+[MG]iB/s' | head -1)
-  bw=$(echo "$bw_line" | grep -oE 'BW=[0-9.]+' | head -1 | cut -d= -f2)
-  bw_unit=$(echo "$bw_line" | grep -oE '[MG]iB/s' | head -1)
-  if [[ -n "$bw" ]]; then
-    # 统一换算成 MB/s，别先转 GiB 再四舍五入，否则 512MiB/s 会变成 0
-    [[ "$bw_unit" == "GiB/s" ]] && bw=$(awk -v x="$bw" 'BEGIN{printf "%.0f",x*1024}')
-    ss=$(tier_score "$bw" "1000:10 500:9 200:8 100:6 50:4")
-    record disk_seq "$ss" "${bw} MB/s" "1M 顺序读；根分区 ${root_size:-?}（速度高不等于容量大）"
-    echo "  顺序读: ${bw} MB/s -> ${ss}/10"
-  else
-    skip disk_seq "无数据" "顺序读测试失败"
-  fi
-else
-  skip disk_rand "未安装 fio" "加 --install-deps 或手动安装"
-  skip disk_seq "未安装 fio" "同上"
-fi
-
-# ---------------------------------------------------------------- 3. 内存
-echo -e "\n${Y}[3/8] 内存${N}"
-avail_kb=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo)
-[[ -z "$avail_kb" ]] && avail_kb=$(awk '/^MemFree:/{print $2; exit}' /proc/meminfo)
-avail_mb=$(awk -v x="${avail_kb:-0}" 'BEGIN{printf "%.0f",x/1024}')
-# 容器里 free 看到的是宿主机内存，用 cgroup 上限压低
-for lim in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
-  [[ -r "$lim" ]] || continue
-  cv=$(cat "$lim" 2>/dev/null)
-  [[ "$cv" =~ ^[0-9]+$ ]] || continue
-  (( cv > 0 && cv < 1099511627776 )) || continue
-  cmb=$(awk -v x="$cv" 'BEGIN{printf "%.0f",x/1048576}')
-  avail_mb=$(awk -v a="$avail_mb" -v b="$cmb" 'BEGIN{printf "%.0f",(a<b?a:b)}')
-  break
-done
-swap_total=$(awk '/^SwapTotal:/{print $2; exit}' /proc/meminfo); swap_total=${swap_total:-0}
-swap_free=$(awk '/^SwapFree:/{print $2; exit}' /proc/meminfo); swap_free=${swap_free:-0}
-ms=$(tier_score "$avail_mb" "15000:10 8000:9 4000:8 2000:6 1000:4")
-note="MemAvailable，已考虑 cgroup 限制"
-if (( swap_total > 0 )); then
-  swap_used=$(( (swap_total - swap_free) * 100 / swap_total ))
-  if (( swap_used > 20 )); then ms=$(( ms > 2 ? ms-1 : 1 )); note+="；swap 已用 ${swap_used}%，扣1分"; fi
-fi
-record mem "$ms" "${avail_mb} MB 可用 / 总 $(awk -v x="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)" 'BEGIN{printf "%.0f",x/1024}') MB" "$note"
-echo "  可用内存: ${avail_mb} MB -> ${ms}/10"
-
-# ---------------------------------------------------------------- 4. TCP 延迟与可用性
-echo -e "\n${Y}[4/8] TCP 延迟与可用性 (真实连接，不用 ICMP)${N}"
-tcp_targets=(
-  "百度|https://www.baidu.com"
-  "腾讯|https://www.qq.com"
-  "阿里云|https://www.aliyun.com"
-  "Cloudflare|https://www.cloudflare.com"
-)
-[[ -n "$SITE_URL" ]] && tcp_targets+=("你的网站|${SITE_URL}")
-connects=(); ttfbs=(); fail=0; tried=0
-for item in "${tcp_targets[@]}"; do
-  label=${item%%|*}; url=${item#*|}
-  cvals=(); tvals=()
-  for i in 1 2 3; do
-    timing=$(timeout 7 curl -sL -o /dev/null --max-time 6 -w '%{time_connect} %{time_starttransfer}' "$url" 2>/dev/null)
-    c=$(echo "$timing" | awk '{print $1}'); t=$(echo "$timing" | awk '{print $2}')
-    tried=$((tried+1))
-    if [[ -n "$c" && -n "$t" ]] && awk -v x="$c" 'BEGIN{exit !(x>0)}'; then
-      cvals+=("$c"); tvals+=("$t")
-    else
-      fail=$((fail+1))
-    fi
-  done
-  if (( ${#cvals[@]} )); then
-    cm=$(median "${cvals[@]}"); tm=$(median "${tvals[@]}")
-    connects+=("$cm"); ttfbs+=("$tm")
-    echo "  ${label}: TCP握手 ${cm}s / 首字节 ${tm}s"
-  else
-    echo "  ${label}: 连接失败"
-  fi
-done
-if (( ${#connects[@]} == 0 )); then
-  skip net_latency "全部连接失败" "按规则不估算延迟"
-  skip net_loss   "全部连接失败" "按规则不估算丢包"
-else
-  med=$(median "${connects[@]}"); tt=$(median "${ttfbs[@]}")
-  failrate=$(awk -v f="$fail" -v n="$tried" 'BEGIN{printf "%.1f",(n>0 ? f*100/n : 100)}')
-  lscore=$(tier_score_low "$med" "0.05:10 0.10:9 0.20:8 0.35:6 0.60:4")
-  loss_score=$(tier_score_low "$failrate" "0.1:10 2:9 5:7 10:5 20:3")
-  record net_latency "$lscore" "TCP握手中位 ${med}s / 首字节 ${tt}s" "真实 HTTPS 连接；SITE_URL 可加入你自己的网站"
-  record net_loss "$loss_score" "连接失败率 ${failrate}% (${fail}/${tried})" "按连接失败计，不再用 ICMP 丢包代替"
-  echo "  TCP中位: ${med}s | 首字节中位: ${tt}s | 失败率: ${failrate}% -> 延迟${lscore}/10 可用性${loss_score}/10"
-fi
-
-# ---------------------------------------------------------------- 5. 去程线路
-echo -e "\n${Y}[5/8] 国内去程线路 (本机只能测去程，不是回程)${N}"
-if [[ $QUICK -eq 1 ]]; then
-  skip route_cn "快速模式跳过" "完整模式运行 mtr/traceroute"
-else
-  rnodes=("219.141.140.10:电信" "210.22.97.1:联通" "120.196.165.24:移动")
-  rsum=0; rcnt=0; rdesc=()
-  for item in "${rnodes[@]}"; do
-    rip=${item%%:*}; rname=${item##*:}; tr=""
-    if need mtr; then
-      tr=$(timeout 15 mtr -r -n -z -c 2 -m 15 "$rip" 2>/dev/null)
-    fi
-    if [[ -z "$tr" ]] && install_pkg traceroute traceroute; then
-      tr=$(timeout 12 traceroute -T -p 80 -m 15 -w 1 -n "$rip" 2>/dev/null)
-      [[ -n "$tr" ]] || tr=$(timeout 12 traceroute -I -m 15 -w 1 -n "$rip" 2>/dev/null)
-    fi
-    if [[ -z "$tr" ]]; then
-      rdesc+=("${rname}:探测失败"); continue
-    fi
-    # 按 ASN 判断，不用裸数字匹配，避免把延迟 163ms 当成 163 线路
-    if echo "$tr" | grep -qE 'AS4809' && echo "$tr" | grep -qE '59\.43\.'; then sc=10; lab="CN2 GIA"
-    elif echo "$tr" | grep -qE 'AS9929'; then sc=9; lab="联通9929精品"
-    elif echo "$tr" | grep -qE 'AS4809'; then sc=8; lab="CN2 GT"
-    elif echo "$tr" | grep -qE 'AS4837|AS4808|219\.158\.'; then sc=7; lab="联通4837"
-    elif echo "$tr" | grep -qE 'AS58453|AS9808|AS56041'; then sc=7; lab="移动CMI"
-    elif echo "$tr" | grep -qE 'AS4134|AS4812'; then sc=5; lab="电信163/普通"
-    else sc=4; lab="普通/未知"; fi
-    rsum=$((rsum+sc)); rcnt=$((rcnt+1)); rdesc+=("${rname}:${lab}")
-  done
-  if (( rcnt > 0 )); then
-    ravg=$(( (rsum+rcnt/2) / rcnt ))
-    record route_cn "$ravg" "$(IFS=,; echo "${rdesc[*]}")" "ASN 级识别；仅去程，真实回程需从国内探针测"
-    echo "  $(IFS=' '; echo "${rdesc[*]}") -> ${ravg}/10"
-  else
-    skip route_cn "全部探测失败" "不给默认分"
-  fi
-fi
-
-# ---------------------------------------------------------------- 6. 带宽（多目标，不依赖单一 Ookla 服务器）
-echo -e "\n${Y}[6/8] 带宽 (多目标下载，取中位)${N}"
-if [[ $QUICK -eq 1 ]]; then
-  skip net_bw "快速模式跳过" "完整模式测多个 CDN 端点"
-else
-  bw_urls=(
-    "Cloudflare|https://speed.cloudflare.com/__down?bytes=10485760"
-    "OVH|https://proof.ovh.net/files/10Mb.dat"
-    "Tele2|https://speedtest.tele2.net/10MB.zip"
-  )
-  vals=(); labs=()
-  for item in "${bw_urls[@]}"; do
-    lab=${item%%|*}; url=${item#*|}
-    got=""
-    for i in 1 2; do
       sp=$(timeout 25 curl -sL -o /dev/null --max-time 22 -w '%{speed_download}' "$url" 2>/dev/null)
       if [[ -n "$sp" ]] && awk -v x="$sp" 'BEGIN{exit !(x>0)}'; then
         mbps=$(awk -v x="$sp" 'BEGIN{printf "%.2f", x*8/1000000}')
-        vals+=("$mbps"); [[ -z "$got" ]] && got="$mbps"
+        evals+=("$mbps")
       fi
     done
-    if [[ -n "$got" ]]; then labs+=("${lab}:${got}"); echo "  ${lab}: ${got} Mbps"; else echo "  ${lab}: 失败"; fi
+    if (( ${#evals[@]} )); then
+      em=$(median "${evals[@]}")
+      endpoint_med+=("$em"); labs+=("${lab}:${em}")
+      echo "  ${lab}: ${em} Mbps (${#evals[@]}/3 次，中位)"
+    else
+      echo "  ${lab}: 失败"
+    fi
   done
-  if (( ${#vals[@]} )); then
-    bw=$(median "${vals[@]}"); lo=$(printf '%s\n' "${vals[@]}" | sort -n | head -1); hi=$(printf '%s\n' "${vals[@]}" | sort -n | tail -1)
+
+  if (( ${#endpoint_med[@]} )); then
+    # 取各端点中位数的较低者，规避单端点对等互联虚高
+    bw=$(printf '%s\n' "${endpoint_med[@]}" | sort -n | head -1)
     bs=$(tier_score "$bw" "200:10 100:9 50:8 30:7 15:5 5:3")
-    pen=0
-    if awk -v a="$lo" -v b="$bw" 'BEGIN{exit !((b>0)&&(a<b*0.5))}'; then bs=$(( bs>1 ? bs-1 : 1 )); pen=1; fi
-    record net_bw "$bs" "中位 ${bw} / 最低 ${lo} / 最高 ${hi} Mbps" "$(IFS=' '; echo "${labs[*]}")；多目标 curl 实测${pen:+；低速波动扣1分}"
-    echo "  中位: ${bw} Mbps (最低 ${lo}, 最高 ${hi}) -> ${bs}/10"
+    note="$(IFS=' '; echo "${labs[*]}")；各端点中位取低者，规避 CDN 虚高"
+    if (( ${#endpoint_med[@]} == 1 )); then note+="；仅1个端点可用，参考性下降"; fi
+    record net_bw "$bs" "${bw} Mbps (端点中位取低)" "$note"
+    echo "  采用: ${bw} Mbps (端点中位取低) -> ${bs}/10"
   else
-    skip net_bw "全部目标失败" "不给默认分"
+    skip net_bw "全部目标失败" "不给默认分；可用 BW_MBPS=30 直接指定"
   fi
 fi
 
