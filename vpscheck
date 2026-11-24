@@ -21,6 +21,7 @@ for arg in "$@"; do
     --install-deps) INSTALL=1 ;;
     -h|--help)
       echo "用法: bash $0 [--quick] [--install-deps]"
+      echo "启动时会询问是否安装缺失工具；--install-deps 表示不再询问直接装"
       exit 0 ;;
     *) echo "未知参数: $arg"; exit 1 ;;
   esac
@@ -50,18 +51,59 @@ fi
 need() {
   command -v "$1" >/dev/null 2>&1
 }
+APT_UPDATED=0
 install_pkg() {
   local cmd=$1 pkg=$2
   need "$cmd" && return 0
-  echo "  ${Y}缺少 $cmd ($pkg)${N}"
-  if (( INSTALL )); then
-    if need apt-get; then apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1
-    elif need yum; then yum install -y "$pkg" >/dev/null 2>&1
-    elif need dnf; then dnf install -y "$pkg" >/dev/null 2>&1
-    fi
-    need "$cmd" && return 0
+  if (( ! INSTALL )); then
+    echo "  ${Y}缺少 $cmd ($pkg)${N}"
+    return 1
   fi
+  if need apt-get; then
+    (( APT_UPDATED )) || { apt-get update -qq >/dev/null 2>&1; APT_UPDATED=1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1
+  elif need yum; then
+    yum install -y "$pkg" >/dev/null 2>&1
+  elif need dnf; then
+    dnf install -y "$pkg" >/dev/null 2>&1
+  fi
+  if need "$cmd"; then return 0; fi
+  echo "  ${R}安装失败：$pkg${N}"
   return 1
+}
+
+# 开跑前先问要不要装缺失工具；非交互环境直接跳过
+preflight() {
+  local -a pairs=("sysbench:sysbench" "fio:fio")
+  (( QUICK )) || pairs+=("traceroute:traceroute" "speedtest-cli:speedtest-cli")
+  local -a miss_cmd=() miss_pkg=()
+  local item c p answer i
+  for item in "${pairs[@]}"; do
+    c=${item%%:*}; p=${item##*:}
+    need "$c" || { miss_cmd+=("$c"); miss_pkg+=("$p"); }
+  done
+  (( ${#miss_cmd[@]} )) || return 0
+  echo "  ${Y}缺少工具：${miss_pkg[*]}${N}"
+  if (( INSTALL )); then
+    answer="y"
+  elif [[ -t 0 ]]; then
+    read -r -p "  现在安装？需要 root 权限。[Y/n] " answer
+  else
+    echo "  ${D}非交互运行，跳过安装；可加 --install-deps 强制安装${N}"
+    return 0
+  fi
+  case "$answer" in
+    ""|y|Y|yes|YES|Yes)
+      INSTALL=1
+      for i in "${!miss_cmd[@]}"; do
+        echo "  → 安装 ${miss_pkg[$i]} ..."
+        install_pkg "${miss_cmd[$i]}" "${miss_pkg[$i]}" || echo "  ${R}跳过 ${miss_pkg[$i]}${N}"
+      done
+      ;;
+    *)
+      echo "  ${D}已跳过，相关项目会显示 N/A${N}"
+      ;;
+  esac
 }
 
 ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 >= b+0)}'; }
@@ -108,6 +150,9 @@ echo "${B}=========================================${N}"
 echo "${B} VPS 评测 v6.0 — 场景化评分 (${MODE_NAME})${N}"
 echo "${B} 测不到 → N/A，不估算；一次跑完，按场景分别出分${N}"
 echo "${B}=========================================${N}"
+
+echo -e "\n${Y}启动前检查工具${N}"
+preflight
 
 # ---------------------------------------------------------------- 1. CPU
 echo -e "\n${Y}[1/8] CPU 性能与超售情况${N}"
