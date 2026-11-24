@@ -539,7 +539,7 @@ while IFS='|' read -r pname wlist; do
   cov=$(awk "BEGIN{printf \"%.2f\", ${den:1}}")
   PSCORE[$pname]=$val; PCOVER[$pname]=$cov
   PFLAG[$pname]=0
-  awk -v c="$cov" 'BEGIN{exit !(c<0.50)}' && PFLAG[$pname]=1
+  awk -v c="$cov" 'BEGIN{exit !(c<0.80)}' && PFLAG[$pname]=1
   if awk -v a="$val" -v b="$bestv" 'BEGIN{exit !(a>b)}'; then best=$pname; bestv=$val; fi
 done < <(profiles)
 for pname in "${!PSCORE[@]}"; do
@@ -559,7 +559,7 @@ done | sort -n | head -3 | while read -r s n r; do printf "  - %-14s %s/10  (%s)
 if [[ "$bestv" == "-1" ]]; then
   echo -e "\n${Y}结论：可用指标不足，无法评分。${N}"
 else
-  if awk -v c="${PCOVER[$best]:-0}" 'BEGIN{exit !(c<0.50)}'; then
+  if awk -v c="${PCOVER[$best]:-0}" 'BEGIN{exit !(c<0.80)}'; then
     echo -e "\n${Y}结论：${best} 相对最好 (${bestv}/10)，但只覆盖 ${PCOVER[$best]} 权重，样本不足，不能用于购买决策。${N}"
   else
     echo -e "\n${G}结论：${best} 场景表现最好 (${bestv}/10，覆盖 ${PCOVER[$best]})${N}"
